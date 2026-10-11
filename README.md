@@ -1,6 +1,6 @@
 # Gekijyou
 
-Gekijyou is an animation framework for creating VOICEROID theater (VOICEROID劇場) videos.
+Gekijyou is an animation framework for creating VOICEROID theater (VOICEROID 劇場) videos.
 
 ## License
 

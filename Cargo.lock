@@ -3,7 +3,14 @@
 version = 4
 
 [[package]]
-name = "gekijyou"
+name = "benchmark"
+version = "0.0.1"
+dependencies = [
+ "gekijyou-computation",
+]
+
+[[package]]
+name = "gekijyou-computation"
 version = "0.0.1"
 dependencies = [
  "slotmap",

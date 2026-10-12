@@ -1,10 +1,19 @@
-[package]
-name = "gekijyou"
+[workspace]
+members = ["crates/gekijyou-computation", "benchmark"]
+default-members = ["crates/gekijyou-computation"]
+resolver = "3"
+
+[workspace.package]
 version = "0.0.1"
 edition = "2024"
 license = "GPL-3.0-only"
 
-[dependencies]
+[workspace.dependencies]
+gekijyou-computation = { path = "crates/gekijyou-computation" }
 slotmap = "1.1.1"
-smallvec = "1"
+smallvec = "1.16.3"
 thiserror = "2.0.21"
+
+[profile.perf]
+inherits = "release"
+debug = 1

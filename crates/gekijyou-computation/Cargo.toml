@@ -1,0 +1,10 @@
+[package]
+name = "gekijyou-computation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+slotmap.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true

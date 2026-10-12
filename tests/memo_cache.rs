@@ -629,3 +629,157 @@ fn lazy_invalidation_and_evaluator_drop_release_cached_values() {
         assert!(new_weak.upgrade().is_none());
     }
 }
+
+#[test]
+fn continuous_reuse_preserves_non_clone_repeated_edges_and_retained_results() {
+    #[derive(PartialEq, Eq)]
+    struct Value(u64);
+    struct Output([u64; 3]);
+    for policy in [CachePolicy::Last, CachePolicy::Lru { capacity: 2 }] {
+        let mut graph = Graph::new();
+        graph.set_default_eq::<Value>();
+        let a = graph.input::<Value>();
+        let b = graph.input::<Value>();
+        let target = graph.map((a, b, a), |a: &Value, b: &Value, again: &Value| {
+            assert!(std::ptr::eq(a, again));
+            Output([a.0, b.0, again.0])
+        });
+        graph.set_cache_policy(target, policy).unwrap();
+        let mut evaluator = Evaluator::new(&graph);
+        let mut retained = Vec::new();
+        for n in 0..12 {
+            let mut context = Context::new(&graph);
+            context.set(&graph, a, Value(n)).unwrap();
+            context.set(&graph, b, Value(n + 100)).unwrap();
+            let (result, request) = sample(&graph, &mut evaluator, context, target);
+            assert_eq!(result.get(request).unwrap().0, [n, n + 100, n]);
+            retained.push((result, request));
+        }
+        assert_eq!(evaluator.stats().computation_calls, 12);
+        assert_eq!(evaluator.stats().memo_misses, 12);
+        let mut context = Context::new(&graph);
+        context.set(&graph, a, Value(11)).unwrap();
+        context.set(&graph, b, Value(111)).unwrap();
+        let (result, request) = sample(&graph, &mut evaluator, context, target);
+        assert!(std::ptr::eq(
+            result.get(request).unwrap(),
+            retained[11].0.get(retained[11].1).unwrap()
+        ));
+        assert_eq!(evaluator.stats().memo_hits, 1);
+        for (n, (result, request)) in retained.iter().enumerate() {
+            assert_eq!(
+                result.get(*request).unwrap().0,
+                [n as u64, n as u64 + 100, n as u64]
+            );
+        }
+    }
+}
+
+#[test]
+fn replacement_clears_reused_revision_before_new_arity_and_equal_inputs() {
+    for policy in [CachePolicy::Last, CachePolicy::Lru { capacity: 2 }] {
+        let mut graph = Graph::new();
+        graph.set_default_eq::<u64>();
+        let a = graph.input::<u64>();
+        let b = graph.input::<u64>();
+        let target = graph.map(a, |a: &u64| a * 10);
+        graph.set_cache_policy(target, policy).unwrap();
+        let mut evaluator = Evaluator::new(&graph);
+        for n in [1, 2, 3] {
+            let mut context = Context::new(&graph);
+            context.set(&graph, a, n).unwrap();
+            sample(&graph, &mut evaluator, context, target);
+        }
+        graph
+            .replace(target, (a, b, a), |a: &u64, b: &u64, again: &u64| {
+                a + b + again
+            })
+            .unwrap();
+        let mut context = Context::new(&graph);
+        context.set(&graph, a, 3).unwrap();
+        context.set(&graph, b, 24).unwrap(); // Same output as old entry, but new definition must run.
+        evaluator.reset_stats();
+        let (old, old_request) = sample(&graph, &mut evaluator, context, target);
+        assert_eq!(old.get(old_request), Ok(&30));
+        assert_eq!(evaluator.stats().computation_calls, 1);
+        assert_eq!(evaluator.stats().memo_hits, 0);
+        assert_eq!(evaluator.stats().memo_comparisons, 0);
+        graph
+            .replace(target, (a, b, a), |a: &u64, b: &u64, again: &u64| {
+                a + b + again + 1
+            })
+            .unwrap();
+        let mut context = Context::new(&graph);
+        context.set(&graph, a, 3).unwrap();
+        context.set(&graph, b, 24).unwrap();
+        evaluator.reset_stats();
+        let (new, request) = sample(&graph, &mut evaluator, context, target);
+        assert_eq!(new.get(request), Ok(&31));
+        assert_eq!(old.get(old_request), Ok(&30));
+        assert_eq!(evaluator.stats().computation_calls, 1);
+        assert_eq!(evaluator.stats().memo_comparisons, 0);
+    }
+}
+
+#[test]
+fn input_and_output_drop_panics_during_eviction_leave_evaluator_reusable() {
+    struct Input {
+        n: u64,
+        bomb: bool,
+    }
+    impl Drop for Input {
+        fn drop(&mut self) {
+            assert!(!self.bomb, "injected input drop panic");
+        }
+    }
+    struct Output {
+        n: u64,
+        bomb: bool,
+    }
+    impl Drop for Output {
+        fn drop(&mut self) {
+            assert!(!self.bomb, "injected output drop panic");
+        }
+    }
+    for panic_input in [true, false] {
+        let mut graph = Graph::new();
+        graph.set_default_equivalence::<Input, _>(|a, b| a.n == b.n);
+        let input = graph.input::<Input>();
+        let target = graph.map(input, move |v: &Input| Output {
+            n: v.n,
+            bomb: !panic_input && v.n == 1,
+        });
+        let mut evaluator = Evaluator::new(&graph);
+        let make_context = |n| {
+            let mut context = Context::new(&graph);
+            context
+                .set(
+                    &graph,
+                    input,
+                    Input {
+                        n,
+                        bomb: panic_input && n == 1,
+                    },
+                )
+                .unwrap();
+            context
+        };
+        let (result, request) = sample(&graph, &mut evaluator, make_context(1), target);
+        assert_eq!(result.get(request).unwrap().n, 1);
+        drop(result); // The old memo owns the last input/output reference that will panic.
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                sample(&graph, &mut evaluator, make_context(2), target);
+            }))
+            .is_err()
+        );
+        evaluator.reset_stats();
+        for _ in 0..2 {
+            let (result, request) = sample(&graph, &mut evaluator, make_context(2), target);
+            assert_eq!(result.get(request).unwrap().n, 2);
+        }
+        assert_eq!(evaluator.stats().computation_calls, 1);
+        assert_eq!(evaluator.stats().memo_hits, 1);
+        assert_eq!(evaluator.stats().memo_misses, 1);
+    }
+}

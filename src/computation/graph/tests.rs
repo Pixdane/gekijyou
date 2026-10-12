@@ -270,3 +270,46 @@ fn policy_configuration_validates_handles_without_changing_versions() {
     }
     assert_eq!(graph.validate(), Ok(()));
 }
+
+#[test]
+fn context_capacity_validates_and_preserves_other_metadata() {
+    let mut graph = Graph::new();
+    let target = graph.constant(7_u64);
+    let foreign = Graph::new();
+    assert_eq!(graph.nodes[target.id].context_cache_capacity, 0);
+    assert_eq!(
+        graph.set_context_cache_capacity(foreign.frame(), 8),
+        Err(GraphError::ForeignNode {
+            node: foreign.frame().id
+        })
+    );
+    let missing: Node<u64> = Node::new(graph.id(), NodeId::null());
+    assert_eq!(
+        graph.set_context_cache_capacity(missing, 8),
+        Err(GraphError::MissingNode { node: missing.id })
+    );
+    let wrong: Node<String> = Node::new(graph.id(), target.id);
+    assert_eq!(
+        graph.set_context_cache_capacity(wrong, 8),
+        Err(GraphError::TypeMismatch { node: target.id })
+    );
+    let frame = graph.frame();
+    assert_eq!(
+        graph.set_context_cache_capacity(frame, 8),
+        Err(GraphError::InputNodeContextCache { node: frame.id })
+    );
+    assert_eq!(graph.nodes[frame.id].context_cache_capacity, 0);
+    graph
+        .set_cache_policy(target, CachePolicy::Transient)
+        .unwrap();
+    for capacity in [8, 8, 1, 0] {
+        graph.set_context_cache_capacity(target, capacity).unwrap();
+        assert_eq!(graph.nodes[target.id].context_cache_capacity, capacity);
+        assert_eq!(graph.nodes[target.id].cache_policy, CachePolicy::Transient);
+        assert_eq!(graph.nodes[target.id].revision, 0);
+        assert_eq!(graph.replacement_epoch, 0);
+    }
+    graph.set_context_cache_capacity(target, 8).unwrap();
+    graph.replace(target, (), || 9_u64).unwrap();
+    assert_eq!(graph.nodes[target.id].context_cache_capacity, 8);
+}

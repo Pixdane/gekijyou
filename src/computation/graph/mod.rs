@@ -53,6 +53,7 @@ impl Graph {
                 kind: NodeKind::Input,
                 semantics: frame_semantics,
                 cache_policy: CachePolicy::default(),
+                context_cache_capacity: 0,
             }),
         );
 
@@ -176,6 +177,27 @@ impl Graph {
         Ok(())
     }
 
+    /// Enables bounded external-input projection caching for this computation.
+    ///
+    /// Zero (the default) disables this cache; otherwise retain at most `capacity`
+    /// projections in LRU order. Independent of direct-input memo policy. Validates
+    /// ownership, existence, type and computation kind before editing. Versions do
+    /// not change. Evaluators apply capacity changes lazily, discarding only this
+    /// node's context history; reapplying the same capacity preserves it.
+    /// Retained Arcs may own large values: entry bounds are not byte bounds.
+    pub fn set_context_cache_capacity<T: 'static>(
+        &mut self,
+        node: Node<T>,
+        capacity: usize,
+    ) -> Result<(), GraphError> {
+        self.check_node(node.graph_id, node.id, TypeId::of::<T>())?;
+        if matches!(self.nodes[node.id].kind, NodeKind::Input) {
+            return Err(GraphError::InputNodeContextCache { node: node.id });
+        }
+        self.nodes[node.id].context_cache_capacity = capacity;
+        Ok(())
+    }
+
     /// Replaces a computation's closure and inputs, preserving its typed handle.
     ///
     /// `inputs` supports `()`, a single node, or tuples of one to four nodes.
@@ -225,11 +247,16 @@ impl Graph {
                 .cloned()
                 .unwrap_or_default(),
             cache_policy: CachePolicy::default(),
+            context_cache_capacity: 0,
         }
     }
 
     pub(super) fn id(&self) -> GraphId {
         self.id
+    }
+
+    pub(super) fn replacement_epoch(&self) -> u64 {
+        self.replacement_epoch
     }
 
     pub(super) fn node_record(&self, id: NodeId) -> Result<&NodeRecord, GraphError> {

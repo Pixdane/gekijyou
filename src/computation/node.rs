@@ -129,4 +129,6 @@ pub(super) struct NodeRecord {
     pub(super) kind: NodeKind,
     pub(super) semantics: ValueSemantics,
     pub(super) cache_policy: CachePolicy,
+    /// Explicit opt-in retention of external-input projections; zero disables it.
+    pub(super) context_cache_capacity: usize,
 }

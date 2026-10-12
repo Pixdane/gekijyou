@@ -19,6 +19,9 @@ pub enum GraphError {
     /// External inputs read the current context and cannot retain computation results.
     #[error("Input node {node:?} cannot have a computation cache policy")]
     InputNodeCachePolicy { node: NodeId },
+    /// Context projection caches retain computation results, not external inputs.
+    #[error("Input node {node:?} cannot have a context cache")]
+    InputNodeContextCache { node: NodeId },
     /// The built-in frame node is no longer an input.
     #[error("Frame node must be an external input")]
     InvalidFrame,

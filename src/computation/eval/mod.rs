@@ -2,6 +2,7 @@ use super::{
     batch::{BatchResults, ContextId, RequestBatch},
     cache::NodeCache,
     context::Context,
+    context_cache::NodeContextCache,
     error::{EvalError, GraphError},
     graph::Graph,
     node::{GraphId, NodeId, NodeKind},
@@ -22,17 +23,27 @@ pub struct EvalStats {
     pub memo_comparisons: u64,
     /// Closure invocations, including those that subsequently panic.
     pub computation_calls: u64,
+    /// Successful external-input projection reuse, excluding direct memo hits.
+    pub context_hits: u64,
+    /// Completed projection queries without a match; missing inputs skip queries.
+    pub context_misses: u64,
+    /// Actual external-input equivalence checks, including identity comparisons.
+    pub context_comparisons: u64,
+    /// Node resolution entries, including temporary sharing and immediate hits.
+    pub resolution_visits: u64,
 }
 
 /// Serial, on-demand evaluation of batches bound to one graph identity.
 ///
-/// Retains node-local direct-input memo entries according to each node's policy.
-/// Revisions and policies synchronize lazily; editing one node preserves other
-/// nodes' history. Reusable after errors and computation panics caught by the caller.
+/// Retains direct-input memo and opt-in external-input projection caches separately.
+/// Revisions, replacement epochs and configurations synchronize lazily. Replacing
+/// a node preserves other nodes' direct memo; context caches conservatively rebuild.
+/// Reusable after errors and computation panics caught by the caller.
 /// Retained input/output Arcs live until eviction, invalidation or evaluator drop.
 pub struct Evaluator {
     graph_id: GraphId,
     caches: SecondaryMap<NodeId, NodeCache>,
+    context_caches: SecondaryMap<NodeId, NodeContextCache>,
     stats: EvalStats,
 }
 
@@ -42,6 +53,7 @@ impl Evaluator {
         Self {
             graph_id: graph.id(),
             caches: SecondaryMap::new(),
+            context_caches: SecondaryMap::new(),
             stats: EvalStats::default(),
         }
     }
@@ -60,8 +72,9 @@ impl Evaluator {
     ///
     /// Validates every target before executing any closure. Missing external inputs
     /// are discovered only when reached. Each node is evaluated at most once per
-    /// context in this batch. Persistent memo lookup still resolves all direct
-    /// dependencies; it never skips the dependency chain based on root inputs.
+    /// context in this batch. Direct memo lookup resolves dependencies; enabled
+    /// context caches can return before visiting any dependencies. Repeated context
+    /// hits may compare projections again without invoking any closure.
     /// Empty batches succeed, and unused contexts do no work.
     ///
     /// On error, no partial BatchResults are returned and temporary values are released.
@@ -105,10 +118,54 @@ impl Evaluator {
         values: &mut SecondaryMap<NodeId, SharedValue>,
         node: NodeId,
     ) -> Result<SharedValue, EvalError> {
+        self.stats.resolution_visits += 1;
         if let Some(value) = values.get(node) {
             return Ok(Arc::clone(value));
         }
         let record = graph.node_record(node)?;
+        // This query precedes dependency traversal. Hits deliberately do not
+        // populate the dense temporary map, which could grow to a large NodeId.
+        if record.context_cache_capacity == 0 {
+            self.context_caches.remove(node);
+        } else {
+            let epoch = graph.replacement_epoch();
+            if self
+                .context_caches
+                .get(node)
+                .is_none_or(|cache| cache.replacement_epoch != epoch)
+            {
+                let cache = NodeContextCache::new(graph, node, record.context_cache_capacity)?;
+                self.context_caches.insert(node, cache);
+            }
+            let cache = self
+                .context_caches
+                .get_mut(node)
+                .expect("Synchronized context cache");
+            cache.synchronize_capacity(record.context_cache_capacity);
+            // Missing roots must fall back to DFS rather than report an error
+            // here: an earlier dependency may panic before the missing input.
+            if cache
+                .roots
+                .iter()
+                .all(|&root| context.value(root).is_some())
+            {
+                let cached = cache.lookup(|root, previous| {
+                    self.stats.context_comparisons += 1;
+                    let current = context.value(root).expect("Present root input");
+                    Ok::<_, EvalError>(
+                        graph
+                            .node_record(root)?
+                            .semantics
+                            .equivalent(current, previous),
+                    )
+                })?;
+                if let Some(output) = cached {
+                    self.stats.context_hits += 1;
+                    return Ok(output);
+                }
+                self.stats.context_misses += 1;
+            }
+        }
         let value = match &record.kind {
             NodeKind::Input => {
                 let value = Arc::clone(context.value(node).ok_or(EvalError::MissingInput {
@@ -182,6 +239,24 @@ impl Evaluator {
                 }
             }
         };
+        if record.context_cache_capacity != 0 {
+            let cache = self
+                .context_caches
+                .get_mut(node)
+                .expect("Synchronized context cache");
+            let roots = cache
+                .roots
+                .iter()
+                .map(|&root| {
+                    Arc::clone(
+                        context
+                            .value(root)
+                            .expect("Successfully resolved root input"),
+                    )
+                })
+                .collect();
+            cache.insert(roots, Arc::clone(&value));
+        }
         values.insert(node, Arc::clone(&value));
         Ok(value)
     }

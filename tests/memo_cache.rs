@@ -58,6 +58,8 @@ fn different_frames_reuse_equal_direct_inputs_and_report_exact_stats() {
             memo_misses: 1,
             memo_comparisons: 1,
             computation_calls: 3,
+            resolution_visits: 6,
+            ..EvalStats::default()
         }
     );
     let previous = evaluator.reset_stats();
@@ -114,6 +116,7 @@ fn transient_and_zero_capacity_share_only_within_a_context() {
             evaluator.stats(),
             EvalStats {
                 computation_calls: 4,
+                resolution_visits: 8,
                 ..EvalStats::default()
             }
         );
@@ -146,6 +149,8 @@ fn identity_semantics_reuse_shared_objects_but_not_equal_new_allocations() {
             memo_misses: 3,
             memo_comparisons: 2,
             computation_calls: 7,
+            resolution_visits: 8,
+            ..EvalStats::default()
         }
     );
 }
@@ -234,6 +239,8 @@ fn replacing_upstream_preserves_downstream_history_and_old_results() {
             memo_misses: 1,
             memo_comparisons: 2,
             computation_calls: 1,
+            resolution_visits: 4,
+            ..EvalStats::default()
         }
     );
     // Replacing B itself must invalidate even though its input is identical.
@@ -417,7 +424,13 @@ fn cached_consumer_still_requires_its_dependencies_and_current_context_inputs() 
         evaluator.evaluate_batch(&graph, batch),
         Err(EvalError::MissingInput { .. })
     ));
-    assert_eq!(evaluator.stats(), EvalStats::default());
+    assert_eq!(
+        evaluator.stats(),
+        EvalStats {
+            resolution_visits: 2,
+            ..EvalStats::default()
+        }
+    );
 }
 
 #[test]
@@ -448,6 +461,8 @@ fn memo_reuses_across_contexts_without_counting_duplicate_requests_as_hits() {
             memo_misses: 1,
             memo_comparisons: 1,
             computation_calls: 3,
+            resolution_visits: 8,
+            ..EvalStats::default()
         }
     );
 }
@@ -473,7 +488,13 @@ fn input_policy_is_rejected_and_current_context_value_is_preserved() {
             assert_eq!(results.get(request), Ok(&n));
         }
     }
-    assert_eq!(evaluator.stats(), EvalStats::default());
+    assert_eq!(
+        evaluator.stats(),
+        EvalStats {
+            resolution_visits: 6,
+            ..EvalStats::default()
+        }
+    );
 }
 
 #[test]

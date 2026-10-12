@@ -1,5 +1,5 @@
 use super::*;
-use crate::computation::{ComputationDefinition, ComputationInputs, Node};
+use crate::computation::{ComputationDefinition, ComputationInputs, FrameIndex, Node};
 use slotmap::Key;
 use std::{
     any::TypeId,
@@ -63,19 +63,27 @@ fn erased_output_type_is_checked_before_publishing() {
             ComputationDefinition::new(Box::new([]), Box::new(|_| Arc::new("wrong")))
         }
     }
-    let mut graph = Graph::new();
-    let node = graph.map(WrongOutput, ());
-    let mut evaluator = Evaluator::new(&graph);
-    for _ in 0..2 {
-        let mut batch = RequestBatch::new(&graph);
-        let context = batch.add_context(Context::new(&graph)).unwrap();
-        batch.request(context, node).unwrap();
-        assert!(matches!(evaluator.evaluate_batch(&graph, batch),
+    for capacity in [0, 1] {
+        let mut graph = Graph::new();
+        let node = graph.map(WrongOutput, ());
+        graph.set_context_cache_capacity(node, capacity).unwrap();
+        let mut evaluator = Evaluator::new(&graph);
+        for _ in 0..2 {
+            let mut batch = RequestBatch::new(&graph);
+            let context = batch.add_context(Context::new(&graph)).unwrap();
+            batch.request(context, node).unwrap();
+            assert!(matches!(evaluator.evaluate_batch(&graph, batch),
             Err(EvalError::Graph(GraphError::TypeMismatch { node: id })) if id == node.id));
+        }
+        assert_eq!(evaluator.stats().computation_calls, 2);
+        assert_eq!(evaluator.stats().memo_misses, 2);
+        assert_eq!(evaluator.stats().memo_hits, 0);
+        assert_eq!(
+            evaluator.stats().context_misses,
+            if capacity == 0 { 0 } else { 2 }
+        );
+        assert_eq!(evaluator.stats().context_hits, 0);
     }
-    assert_eq!(evaluator.stats().computation_calls, 2);
-    assert_eq!(evaluator.stats().memo_misses, 2);
-    assert_eq!(evaluator.stats().memo_hits, 0);
 }
 
 #[test]
@@ -104,4 +112,35 @@ fn all_targets_are_validated_before_any_closure_executes() {
         assert!(matches!(result, Err(EvalError::Graph(error)) if error == expected));
     }
     assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn context_hit_does_not_expand_temporary_result_map() {
+    let mut graph = Graph::new();
+    for _ in 0..10_000 {
+        graph.constant(0_u64);
+    }
+    let target = graph.map(graph.frame(), |f: &FrameIndex| f.0);
+    graph.set_context_cache_capacity(target, 1).unwrap();
+    let mut evaluator = Evaluator::new(&graph);
+    let mut context = Context::new(&graph);
+    context.set(&graph, graph.frame(), FrameIndex(7)).unwrap();
+    let mut batch = RequestBatch::new(&graph);
+    let id = batch.add_context(context).unwrap();
+    batch.request(id, target).unwrap();
+    evaluator.evaluate_batch(&graph, batch).unwrap();
+    let mut context = Context::new(&graph);
+    context.set(&graph, graph.frame(), FrameIndex(7)).unwrap();
+    let mut batch = RequestBatch::new(&graph);
+    let id = batch.add_context(context).unwrap();
+    let context = batch.context(id).unwrap();
+    let mut values = SecondaryMap::new();
+    evaluator.reset_stats();
+    let output = evaluator
+        .evaluate_node(&graph, context, id, &mut values, target.id)
+        .unwrap();
+    assert_eq!(output.downcast_ref::<u64>(), Some(&7));
+    assert_eq!(values.len(), 0);
+    assert_eq!(values.capacity(), 0);
+    assert_eq!(evaluator.stats().resolution_visits, 1);
 }

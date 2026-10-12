@@ -130,6 +130,8 @@ pub struct Workload {
     last_actor: Node<Actor>,
     metrics: Node<Metrics>,
     caption: Node<Caption>,
+    #[allow(dead_code)]
+    unrelated: Node<u64>,
     style: Style,
     config: Config,
     node_count: usize,
@@ -419,7 +421,7 @@ impl Workload {
             graph.map_with_policy(policy, (aggregates[0], caption_node, viewport), scene);
         let metrics_node = graph.map_with_policy(policy, (aggregates[0], exposure_node), metrics);
         let unused = graph.input::<u64>();
-        graph.map_with_policy(policy, unused, |_: &u64| -> u64 {
+        let unrelated = graph.map_with_policy(policy, unused, |_: &u64| -> u64 {
             panic!("Unrequested branch must not execute")
         });
         node_count += 4;
@@ -435,6 +437,7 @@ impl Workload {
             last_actor,
             metrics: metrics_node,
             caption: caption_node,
+            unrelated,
             style: style(),
             config,
             node_count,
@@ -448,6 +451,32 @@ impl Workload {
         self.graph
             .replace(self.phase, self.phase_input, |n: &u64| n.wrapping_mul(3))
             .unwrap();
+    }
+
+    /// Enable projection caching only at the five requested output boundaries.
+    /// The sixth request duplicates Scene. Internal cheap nodes retain P2 policy.
+    #[allow(dead_code)]
+    pub fn set_context_capacity(&mut self, capacity: usize) {
+        self.graph
+            .set_context_cache_capacity(self.scene, capacity)
+            .unwrap();
+        self.graph
+            .set_context_cache_capacity(self.first_actor, capacity)
+            .unwrap();
+        self.graph
+            .set_context_cache_capacity(self.last_actor, capacity)
+            .unwrap();
+        self.graph
+            .set_context_cache_capacity(self.metrics, capacity)
+            .unwrap();
+        self.graph
+            .set_context_cache_capacity(self.caption, capacity)
+            .unwrap();
+    }
+
+    #[allow(dead_code)]
+    pub fn replace_unrelated(&mut self) {
+        self.graph.replace(self.unrelated, (), || 0_u64).unwrap();
     }
 
     pub fn node_count(&self) -> usize {
@@ -590,6 +619,7 @@ pub fn direct_checksum(outputs: &[DirectOutput]) -> u64 {
     })
 }
 
+#[allow(dead_code)] // P3 datasets use explicit frame sequences instead.
 pub fn inputs(contexts: usize, variant: u64) -> Vec<Input> {
     (0..contexts)
         .map(|i| Input {

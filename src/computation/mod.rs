@@ -115,7 +115,7 @@
 //! A variant or capacity change clears history, even `Last` to `Lru { capacity: 1 }`.
 //! Input nodes always read the current context and reject cache policy configuration.
 //!
-//! Memo comparison uses each direct input source's value semantics. Every visit
+//! Memo comparison uses each direct input source's value semantics. A memo query
 //! still resolves all direct dependencies. Replacing a node invalidates its own
 //! memo, preserving unchanged downstream nodes' history for equal actual inputs.
 //! Cached inputs and outputs are shared Arcs and need not implement `Clone`.
@@ -123,12 +123,44 @@
 //!
 //! [`Evaluator::stats`] reads cumulative [`EvalStats`]; [`Evaluator::reset_stats`]
 //! resets counters without clearing memo. Successful pure-function entries survive
-//! later errors and panics in the same batch. Context caching and parallel scheduling
-//! are not implemented.
+//! later errors and panics in the same batch.
+//!
+//! Context caches are independently opt-in through [`Graph::set_context_cache_capacity`].
+//! Zero disables them by default; positive capacity retains bounded LRU history.
+//! They compare only the transitive external Input ancestors, using each input's
+//! frozen semantics. Zero-input computations contribute no external roots. Hits
+//! return before dependency traversal or direct Memo queries and do not grow
+//! the dense per-context temporary result table. Missing roots skip this query and
+//! follow ordinary DFS failure order. Any successful replacement lazily discards
+//! Context history and rebuilds projections, preserving other nodes' Direct Memo.
+//! Node additions and direct policy changes do not invalidate Context history.
+//! Retained entry counts are bounded, but Arcs can retain arbitrarily large values.
+//! Parallel scheduling is not implemented.
+//!
+//! ```
+//! use gekijyou::computation::{Context, Evaluator, FrameIndex, Graph, RequestBatch};
+//! let mut graph = Graph::new();
+//! let upstream = graph.map(graph.frame(), |f: &FrameIndex| f.0 * 2);
+//! let scene = graph.map(upstream, |n: &u64| n + 1);
+//! graph.set_context_cache_capacity(scene, 8)?;
+//! let mut evaluator = Evaluator::new(&graph);
+//! for _ in 0..2 {
+//!     let mut context = Context::new(&graph);
+//!     context.set(&graph, graph.frame(), FrameIndex(12))?;
+//!     let mut batch = RequestBatch::new(&graph);
+//!     let context = batch.add_context(context)?;
+//!     let request = batch.request(context, scene)?;
+//!     assert_eq!(evaluator.evaluate_batch(&graph, batch)?.get(request)?, &25);
+//! }
+//! assert_eq!(evaluator.stats().context_hits, 1);
+//! assert_eq!(evaluator.stats().resolution_visits, 4); // First chain: 3, next hit: 1.
+//! # Ok::<(), gekijyou::computation::EvalError>(())
+//! ```
 
 mod batch;
 mod cache;
 mod context;
+mod context_cache;
 mod error;
 mod eval;
 mod graph;

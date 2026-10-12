@@ -66,17 +66,27 @@ impl<T> Clone for Node<T> {
     }
 }
 
-/// Cross-batch result retention metadata; no cache is implemented yet.
+/// Retention of node-local results keyed by ordered direct input values.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) enum CachePolicy {
-    /// Do not retain memo entries across batches; batch sharing is still allowed.
+pub enum CachePolicy {
+    /// Share results only within one context in a batch; retain no persistent entries.
     Transient,
     /// Retain the most recently used input combination and result.
     #[default]
     Last,
-    /// Retain at most `capacity` historical input combinations.
-    /// Zero retains no cross-batch memo entries, like `Transient`.
-    Memo { capacity: usize },
+    /// Retain at most `capacity` input combinations, evicting the least recently used.
+    /// Zero retains no persistent memo entries, like `Transient`.
+    Lru { capacity: usize },
+}
+
+impl CachePolicy {
+    pub(super) fn capacity(self) -> usize {
+        match self {
+            Self::Transient => 0,
+            Self::Last => 1,
+            Self::Lru { capacity } => capacity,
+        }
+    }
 }
 
 /// A process-local graph identity independent of graph-local SlotMap keys.

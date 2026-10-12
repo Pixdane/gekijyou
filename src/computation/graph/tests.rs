@@ -34,7 +34,7 @@ fn versions_count_successful_replacements_only() {
     graph.input::<String>();
     graph.constant(99_u64);
     graph.map(input, |n: &u64| n + 1);
-    graph.register_eq::<String>();
+    graph.set_default_eq::<String>();
     assert_eq!(graph.replacement_epoch, 2);
     assert_eq!(graph.nodes[first.id].revision, 2);
     assert!(
@@ -106,10 +106,10 @@ fn either_counter_exhaustion_is_transactional() {
 }
 
 #[test]
-fn equality_registration_and_replacement_preserve_node_semantics() {
+fn default_equality_and_replacement_preserve_node_semantics() {
     let mut graph = Graph::new();
     let early = graph.input::<String>();
-    graph.register_eq::<String>();
+    graph.set_default_eq::<String>();
     let later = graph.constant(String::from("same"));
     let first: SharedValue = Arc::new(String::from("same"));
     let equal: SharedValue = Arc::new(String::from("same"));
@@ -126,7 +126,7 @@ fn equality_registration_and_replacement_preserve_node_semantics() {
     // Replacing a node cannot change the equality policy it was created with.
     let mut identity_graph = Graph::new();
     let original = identity_graph.constant(String::from("same"));
-    identity_graph.register_eq::<String>();
+    identity_graph.set_default_eq::<String>();
     identity_graph
         .replace(original, (), || String::from("same"))
         .unwrap();
@@ -156,7 +156,7 @@ fn replacement_updates_roots_and_preserves_policy_and_repeated_edges() {
     let mut graph = Graph::new();
     let input = graph.input::<u64>();
     let target = graph.constant(3_u64);
-    graph.nodes[target.id].cache_policy = CachePolicy::Memo { capacity: 7 };
+    graph.nodes[target.id].cache_policy = CachePolicy::Lru { capacity: 7 };
     let root_count = graph.roots().count();
     graph
         .replace(target, (input, input), |a: &u64, b: &u64| a + b)
@@ -164,14 +164,14 @@ fn replacement_updates_roots_and_preserves_policy_and_repeated_edges() {
     assert_eq!(graph.roots().count(), root_count - 1);
     assert_eq!(
         graph.nodes[target.id].cache_policy,
-        CachePolicy::Memo { capacity: 7 }
+        CachePolicy::Lru { capacity: 7 }
     );
     assert_eq!(graph.validate(), Ok(()));
     graph.replace(target, (), || 5_u64).unwrap();
     assert_eq!(graph.roots().count(), root_count);
     assert_eq!(
         graph.nodes[target.id].cache_policy,
-        CachePolicy::Memo { capacity: 7 }
+        CachePolicy::Lru { capacity: 7 }
     );
 }
 
@@ -204,4 +204,69 @@ fn validation_checks_disconnected_cycles_independently_of_replace() {
         type_id: TypeId::of::<String>(),
     }]);
     assert_eq!(graph.validate(), Err(GraphError::Cycle));
+}
+
+#[test]
+fn custom_equivalence_is_frozen_at_creation_and_preserved_by_replace() {
+    let mut graph = Graph::new();
+    let early = graph.constant(0.0_f64);
+    graph.set_default_equivalence::<f64, _>(|a, b| a.to_bits() == b.to_bits());
+    let later = graph.constant(0.0_f64);
+    let positive: SharedValue = Arc::new(0.0_f64);
+    let same: SharedValue = Arc::new(0.0_f64);
+    let negative: SharedValue = Arc::new(-0.0_f64);
+    assert!(!graph.nodes[early.id].semantics.equivalent(&positive, &same));
+    assert!(graph.nodes[later.id].semantics.equivalent(&positive, &same));
+    assert!(
+        !graph.nodes[later.id]
+            .semantics
+            .equivalent(&positive, &negative)
+    );
+    graph.set_default_equivalence::<f64, _>(|a, b| a == b);
+    graph.replace(later, (), || -0.0_f64).unwrap();
+    assert!(
+        !graph.nodes[later.id]
+            .semantics
+            .equivalent(&positive, &negative)
+    );
+}
+
+#[test]
+fn policy_configuration_validates_handles_without_changing_versions() {
+    let mut graph = Graph::new();
+    let node = graph.constant(1_u64);
+    let foreign = Graph::new();
+    assert_eq!(
+        graph.set_cache_policy(foreign.frame(), CachePolicy::Transient),
+        Err(GraphError::ForeignNode {
+            node: foreign.frame().id
+        })
+    );
+    let missing: Node<u64> = Node::new(graph.id(), NodeId::null());
+    assert_eq!(
+        graph.set_cache_policy(missing, CachePolicy::Last),
+        Err(GraphError::MissingNode { node: missing.id })
+    );
+    let wrong: Node<String> = Node::new(graph.id(), node.id);
+    assert_eq!(
+        graph.set_cache_policy(wrong, CachePolicy::Last),
+        Err(GraphError::TypeMismatch { node: node.id })
+    );
+    for policy in [
+        CachePolicy::Transient,
+        CachePolicy::Last,
+        CachePolicy::Lru { capacity: 4 },
+    ] {
+        let frame = graph.frame();
+        assert_eq!(
+            graph.set_cache_policy(frame, policy),
+            Err(GraphError::InputNodeCachePolicy { node: frame.id })
+        );
+        assert_eq!(graph.nodes[frame.id].cache_policy, CachePolicy::default());
+        graph.set_cache_policy(node, policy).unwrap();
+        assert_eq!(graph.nodes[node.id].cache_policy, policy);
+        assert_eq!(graph.nodes[node.id].revision, 0);
+        assert_eq!(graph.replacement_epoch, 0);
+    }
+    assert_eq!(graph.validate(), Ok(()));
 }

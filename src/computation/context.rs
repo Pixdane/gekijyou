@@ -40,6 +40,9 @@ impl Context {
     ///
     /// The context, graph and node must belong to the same graph. Computation
     /// nodes, including constants, cannot receive external values.
+    /// Each assignment creates a fresh stored shared object; configure the source
+    /// node's default equivalence before creating it for reuse across contexts.
+    /// See the [module's shared-resource example](super#value-and-computation-contracts).
     pub fn set<T: Send + Sync + 'static>(
         &mut self,
         graph: &Graph,

@@ -1,7 +1,8 @@
 //! Shared fixture for correctness tests and the release performance example.
 //! This is an integer scene-state workload, not rendering or GPU work.
 use gekijyou::computation::{
-    BatchResults, Context, Evaluator, FrameIndex, Graph, Node, RequestBatch, RequestId,
+    BatchResults, CachePolicy, ComputationInputs, Context, Evaluator, FrameIndex, Graph, Node,
+    RequestBatch, RequestId,
 };
 use std::sync::Arc;
 
@@ -12,7 +13,7 @@ pub struct Config {
     pub rounds: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Viewport {
     pub width: u32,
     pub height: u32,
@@ -30,7 +31,7 @@ struct Style {
     palette: Vec<u64>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Camera {
     x: i64,
     y: i64,
@@ -53,7 +54,7 @@ pub struct Caption {
     anchor_x: i64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Aggregate {
     signature: u64,
     visible: u32,
@@ -119,6 +120,10 @@ pub struct DirectOutput {
 pub struct Workload {
     graph: Graph,
     viewport: Node<Viewport>,
+    #[allow(dead_code)]
+    phase: Node<u64>,
+    #[allow(dead_code)]
+    phase_input: Node<u64>,
     seed: Node<u64>,
     scene: Node<Scene>,
     first_actor: Node<Actor>,
@@ -272,8 +277,42 @@ fn checksum(snapshot: &Snapshot) -> u64 {
         ^ snapshot.duplicate_scene.signature.rotate_left(43)
 }
 
+/// How newly created scene values are compared as downstream memo inputs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ValueComparison {
+    #[allow(dead_code)] // The cache timing example uses only content comparison.
+    Identity,
+    Content,
+}
+
+// Fixture-only helper: apply the selected policy as each typed node is created.
+trait MapWithPolicy {
+    fn map_with_policy<I, F, O>(&mut self, policy: CachePolicy, inputs: I, f: F) -> Node<O>
+    where
+        I: ComputationInputs<F, O>,
+        O: 'static;
+}
+
+impl MapWithPolicy for Graph {
+    fn map_with_policy<I, F, O>(&mut self, policy: CachePolicy, inputs: I, f: F) -> Node<O>
+    where
+        I: ComputationInputs<F, O>,
+        O: 'static,
+    {
+        let node = self.map(inputs, f);
+        self.set_cache_policy(node, policy).unwrap();
+        node
+    }
+}
+
 impl Workload {
+    #[allow(dead_code)] // The cache timing example always supplies explicit options.
     pub fn new(config: Config) -> Self {
+        Self::configured(config, CachePolicy::Last, ValueComparison::Identity)
+    }
+
+    /// Same scene and closures; optional exact content semantics for P2 reuse loads.
+    pub fn configured(config: Config, policy: CachePolicy, comparison: ValueComparison) -> Self {
         assert!(config.actors > 0);
         let style = || Style {
             palette: (0..16)
@@ -281,17 +320,28 @@ impl Workload {
                 .collect(),
         };
         let mut graph = Graph::new();
+        if comparison == ValueComparison::Content {
+            graph.set_default_eq::<u64>();
+            graph.set_default_eq::<i64>();
+            graph.set_default_eq::<Viewport>();
+            graph.set_default_eq::<Camera>();
+            graph.set_default_eq::<Actor>();
+            graph.set_default_eq::<Caption>();
+            graph.set_default_eq::<Aggregate>();
+        }
         let viewport = graph.input::<Viewport>();
         let seed = graph.input::<u64>();
         let style_node = graph.constant(style());
-        let base = graph.map((), || BASE);
+        graph.set_cache_policy(style_node, policy).unwrap();
+        let base = graph.map_with_policy(policy, (), || BASE);
         // The replacement connects an early node to a later node, so graph storage
         // order cannot be used as an execution schedule.
-        let phase_node = graph.map((), || 0_u64);
-        let camera_node = graph.map((phase_node, viewport), camera);
-        let exposure_node = graph.map(phase_node, exposure);
-        let caption_node = graph.map((phase_node, camera_node), caption);
-        let later_phase = graph.map(graph.frame(), |frame: &FrameIndex| frame.0 / 4);
+        let phase_node = graph.map_with_policy(policy, (), || 0_u64);
+        let camera_node = graph.map_with_policy(policy, (phase_node, viewport), camera);
+        let exposure_node = graph.map_with_policy(policy, phase_node, exposure);
+        let caption_node = graph.map_with_policy(policy, (phase_node, camera_node), caption);
+        let later_phase =
+            graph.map_with_policy(policy, graph.frame(), |frame: &FrameIndex| frame.0 / 4);
         graph
             .replace(phase_node, later_phase, |n: &u64| n.wrapping_mul(3))
             .unwrap();
@@ -299,32 +349,43 @@ impl Workload {
         // Ten shared nodes above, including the built-in FrameIndex.
         let mut node_count = 10;
         for index in 0..config.actors {
-            let mut state = graph.map(
+            let mut state = graph.map_with_policy(
+                policy,
                 (phase_node, seed, style_node, base),
                 move |p: &u64, s: &u64, style: &Style, base: &u64| {
                     actor_seed(p, s, style, base, index)
                 },
             );
-            let x = graph.map((phase_node, camera_node), move |p: &u64, c: &Camera| {
-                position(p, c, index)
-            });
+            let x = graph.map_with_policy(
+                policy,
+                (phase_node, camera_node),
+                move |p: &u64, c: &Camera| position(p, c, index),
+            );
             for stage in 0..config.stages {
-                let a = graph.map((state, camera_node), move |s: &u64, c: &Camera| {
-                    left(s, c, stage, config.rounds)
-                });
-                let b = graph.map((state, exposure_node), move |s: &u64, e: &u64| {
-                    right(s, e, stage, config.rounds)
-                });
-                state = graph.map((a, b, state, a), merge);
+                let a = graph.map_with_policy(
+                    policy,
+                    (state, camera_node),
+                    move |s: &u64, c: &Camera| left(s, c, stage, config.rounds),
+                );
+                let b = graph.map_with_policy(
+                    policy,
+                    (state, exposure_node),
+                    move |s: &u64, e: &u64| right(s, e, stage, config.rounds),
+                );
+                state = graph.map_with_policy(policy, (a, b, state, a), merge);
             }
-            actors.push(graph.map((state, x, exposure_node, style_node), actor));
+            actors.push(graph.map_with_policy(
+                policy,
+                (state, x, exposure_node, style_node),
+                actor,
+            ));
             node_count += 3 + config.stages * 3;
         }
         let first_actor = actors[0];
         let last_actor = actors[actors.len() - 1];
         let mut aggregates: Vec<_> = actors
             .into_iter()
-            .map(|a| graph.map(a, aggregate_actor))
+            .map(|a| graph.map_with_policy(policy, a, aggregate_actor))
             .collect();
         node_count += aggregates.len();
         while aggregates.len() > 1 {
@@ -333,26 +394,32 @@ impl Workload {
                 .map(|chunk| {
                     node_count += 1;
                     match chunk {
-                        [a, b, c, d] => graph.map((*a, *b, *c, *d), combine_four),
-                        [a, b, c] => graph.map(
+                        [a, b, c, d] => {
+                            graph.map_with_policy(policy, (*a, *b, *c, *d), combine_four)
+                        }
+                        [a, b, c] => graph.map_with_policy(
+                            policy,
                             (*a, *b, *c),
                             |a: &Aggregate, b: &Aggregate, c: &Aggregate| {
                                 combine(combine(*a, *b), *c)
                             },
                         ),
-                        [a, b] => {
-                            graph.map((*a, *b), |a: &Aggregate, b: &Aggregate| combine(*a, *b))
-                        }
-                        [a] => graph.map(*a, |a: &Aggregate| *a),
+                        [a, b] => graph.map_with_policy(
+                            policy,
+                            (*a, *b),
+                            |a: &Aggregate, b: &Aggregate| combine(*a, *b),
+                        ),
+                        [a] => graph.map_with_policy(policy, *a, |a: &Aggregate| *a),
                         _ => unreachable!(),
                     }
                 })
                 .collect();
         }
-        let scene_node = graph.map((aggregates[0], caption_node, viewport), scene);
-        let metrics_node = graph.map((aggregates[0], exposure_node), metrics);
+        let scene_node =
+            graph.map_with_policy(policy, (aggregates[0], caption_node, viewport), scene);
+        let metrics_node = graph.map_with_policy(policy, (aggregates[0], exposure_node), metrics);
         let unused = graph.input::<u64>();
-        graph.map(unused, |_: &u64| -> u64 {
+        graph.map_with_policy(policy, unused, |_: &u64| -> u64 {
             panic!("Unrequested branch must not execute")
         });
         node_count += 4;
@@ -360,6 +427,8 @@ impl Workload {
         Self {
             graph,
             viewport,
+            phase: phase_node,
+            phase_input: later_phase,
             seed,
             scene: scene_node,
             first_actor,
@@ -370,6 +439,15 @@ impl Workload {
             config,
             node_count,
         }
+    }
+
+    /// Install a fresh phase definition with equivalent output. Graph validation
+    /// is part of this edit; unchanged downstream history must remain usable.
+    #[allow(dead_code)] // Shared fixture; the legacy timing example does not edit.
+    pub fn replace_phase(&mut self) {
+        self.graph
+            .replace(self.phase, self.phase_input, |n: &u64| n.wrapping_mul(3))
+            .unwrap();
     }
 
     pub fn node_count(&self) -> usize {

@@ -1,7 +1,7 @@
 use super::{batch::ContextId, node::NodeId};
 use thiserror::Error;
 
-/// A graph ownership, dependency, or structure validation failure.
+/// A graph ownership, configuration, dependency, or structure validation failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum GraphError {
     /// The handle or dependency belongs to another graph.
@@ -16,6 +16,9 @@ pub enum GraphError {
     /// External input nodes cannot be replaced by computation closures.
     #[error("Input node {node:?} cannot be replaced")]
     InputNodeReplacement { node: NodeId },
+    /// External inputs read the current context and cannot retain computation results.
+    #[error("Input node {node:?} cannot have a computation cache policy")]
+    InputNodeCachePolicy { node: NodeId },
     /// The built-in frame node is no longer an input.
     #[error("Frame node must be an external input")]
     InvalidFrame,

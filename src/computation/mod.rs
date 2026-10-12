@@ -2,7 +2,8 @@
 //!
 //! [`Graph`] defines nodes and their explicit dependencies. [`Context`] supplies
 //! external inputs for one sample. [`RequestBatch`] groups contexts and targets;
-//! [`Evaluator`] evaluates them serially, sharing dependencies within each context.
+//! [`Evaluator`] evaluates them serially, sharing dependencies within each context
+//! and retaining node-local memo results across contexts and batches.
 //! [`BatchResults`] owns the requested outputs independently of the graph.
 //!
 //! # Build and evaluate
@@ -67,22 +68,66 @@
 //! must remain semantically immutable, including values with interior mutability.
 //! Allocation addresses and reference counts are not stable computation inputs.
 //!
-//! Values default to shared-object identity comparison. [`Graph::register_eq`]
-//! installs content comparison for subsequently created nodes of a type; existing
-//! nodes retain their semantics. The built-in [`FrameIndex`] starts with content
-//! comparison. Equality must be a stable equivalence relation and permit substitution
+//! Values default to shared-object identity comparison. [`Graph::set_default_eq`]
+//! and [`Graph::set_default_equivalence`] configure comparison for subsequently
+//! created nodes of a type; existing nodes retain their semantics, including after
+//! replacement. The built-in [`FrameIndex`] starts with content comparison.
+//! Equality must be a stable equivalence relation and permit substitution
 //! in every downstream computation. Approximate comparisons that violate these laws
 //! cannot serve as general cache equality. Floating-point bitwise distinctions,
-//! including positive and negative zero, require an appropriate wrapper or comparator.
+//! including positive and negative zero, can use a comparator based on `to_bits()`.
 //!
-//! # Current evaluation scope
+//! [`Context::set`] creates a fresh stored shared object for each assignment. Equal
+//! scalar inputs need content equivalence for reuse across contexts. For an
+//! `Arc<Resource>` value, use the caller's resource identity explicitly:
 //!
-//! Dependencies are shared within each context in one batch. Equality and cache
-//! policies are retained as metadata for future cross-batch reuse; they do not
-//! participate in evaluation yet. A constant's closure retains its value regardless
-//! of cache policy. Cross-batch caching and parallel scheduling are not implemented.
+//! ```
+//! use gekijyou::computation::{Context, Evaluator, Graph, RequestBatch};
+//! use std::sync::Arc;
+//!
+//! struct Resource { width: u32 }
+//! let resource = Arc::new(Resource { width: 1920 });
+//! let mut graph = Graph::new();
+//! graph.set_default_equivalence::<Arc<Resource>, _>(Arc::ptr_eq);
+//! let input = graph.input::<Arc<Resource>>();
+//! let width = graph.map(input, |r: &Arc<Resource>| r.width);
+//! let mut evaluator = Evaluator::new(&graph);
+//! for _ in 0..2 {
+//!     let mut context = Context::new(&graph);
+//!     context.set(&graph, input, Arc::clone(&resource))?;
+//!     let mut batch = RequestBatch::new(&graph);
+//!     let context = batch.add_context(context)?;
+//!     let request = batch.request(context, width)?;
+//!     assert_eq!(evaluator.evaluate_batch(&graph, batch)?.get(request)?, &1920);
+//! }
+//! assert_eq!(evaluator.stats().computation_calls, 1);
+//! assert_eq!(evaluator.stats().memo_hits, 1);
+//! # Ok::<(), gekijyou::computation::EvalError>(())
+//! ```
+//!
+//! # Cache policy and statistics
+//!
+//! Computations default to [`CachePolicy::Last`], retaining one input combination.
+//! [`CachePolicy::Lru`] retains bounded history with LRU eviction. [`CachePolicy::Transient`]
+//! and `Lru { capacity: 0 }` retain no persistent entries; within-context sharing
+//! remains available. [`Graph::set_cache_policy`] applies lazily on the next visit,
+//! clearing only that node's history when the applied policy changes.
+//! A variant or capacity change clears history, even `Last` to `Lru { capacity: 1 }`.
+//! Input nodes always read the current context and reject cache policy configuration.
+//!
+//! Memo comparison uses each direct input source's value semantics. Every visit
+//! still resolves all direct dependencies. Replacing a node invalidates its own
+//! memo, preserving unchanged downstream nodes' history for equal actual inputs.
+//! Cached inputs and outputs are shared Arcs and need not implement `Clone`.
+//! A constant's closure retains its value regardless of cache policy.
+//!
+//! [`Evaluator::stats`] reads cumulative [`EvalStats`]; [`Evaluator::reset_stats`]
+//! resets counters without clearing memo. Successful pure-function entries survive
+//! later errors and panics in the same batch. Context caching and parallel scheduling
+//! are not implemented.
 
 mod batch;
+mod cache;
 mod context;
 mod error;
 mod eval;
@@ -94,7 +139,7 @@ mod value;
 pub use batch::{BatchResults, ContextId, RequestBatch, RequestId};
 pub use context::Context;
 pub use error::{EvalError, GraphError};
-pub use eval::Evaluator;
+pub use eval::{EvalStats, Evaluator};
 pub use graph::Graph;
 pub use inputs::{ComputationDefinition, ComputationInputs};
-pub use node::{FrameIndex, Node, NodeId};
+pub use node::{CachePolicy, FrameIndex, Node, NodeId};

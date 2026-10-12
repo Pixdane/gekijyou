@@ -1,5 +1,5 @@
 use gekijyou::computation::{
-    Context, EvalError, Evaluator, FrameIndex, Graph, GraphError, RequestBatch,
+    CachePolicy, Context, EvalError, Evaluator, FrameIndex, Graph, GraphError, RequestBatch,
 };
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
@@ -39,6 +39,9 @@ fn diamond_multiple_targets_and_duplicate_requests_share_once_per_context() {
         counter.fetch_add(1, Ordering::Relaxed);
         frame.0 + 1
     });
+    graph
+        .set_cache_policy(shared, CachePolicy::Transient)
+        .unwrap();
     let left = graph.map(shared, |n: &u64| n * 2);
     let right = graph.map(shared, |n: &u64| n * 3);
     let diamond = graph.map((left, right), |l: &u64, r: &u64| l + r);
@@ -288,7 +291,7 @@ fn no_requests_return_success_without_evaluation() {
 }
 
 #[test]
-fn ordinary_computations_are_not_memoized_across_batches() {
+fn transient_computations_are_not_memoized_across_batches() {
     let mut graph = Graph::new();
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = calls.clone();
@@ -296,6 +299,9 @@ fn ordinary_computations_are_not_memoized_across_batches() {
         counter.fetch_add(1, Ordering::Relaxed);
         42_u64
     });
+    graph
+        .set_cache_policy(target, CachePolicy::Transient)
+        .unwrap();
     let mut evaluator = Evaluator::new(&graph);
     for _ in 0..2 {
         let mut batch = RequestBatch::new(&graph);
@@ -319,6 +325,9 @@ fn panic_unwinds_batch_and_evaluator_can_be_reused() {
     }
     let tracker = dropped.clone();
     let temporary = graph.map((), move || Tracked(tracker.clone()));
+    graph
+        .set_cache_policy(temporary, CachePolicy::Transient)
+        .unwrap();
     let panicking = graph.map(temporary, |_: &Tracked| -> u64 {
         panic!("computation panic")
     });
@@ -348,6 +357,9 @@ fn failed_batch_releases_already_computed_values_and_can_be_retried() {
     }
     let tracker = drops.clone();
     let first = graph.map((), move || Tracked(tracker.clone()));
+    graph
+        .set_cache_policy(first, CachePolicy::Transient)
+        .unwrap();
     let missing = graph.input::<u64>();
     let mut evaluator = Evaluator::new(&graph);
     let mut batch = RequestBatch::new(&graph);

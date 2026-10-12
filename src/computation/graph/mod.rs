@@ -24,7 +24,7 @@ pub struct Graph {
     id: GraphId,
     nodes: SlotMap<NodeId, NodeRecord>,
     frame: Node<FrameIndex>,
-    value_semantics: HashMap<TypeId, ValueSemantics>,
+    default_value_semantics: HashMap<TypeId, ValueSemantics>,
     // Counts successful replacements only; node additions do not change this epoch.
     replacement_epoch: u64,
 }
@@ -43,7 +43,7 @@ impl Graph {
         let id = GraphId::new();
         let mut nodes = SlotMap::with_key();
         let frame_semantics = ValueSemantics::by_eq::<FrameIndex>();
-        let value_semantics =
+        let default_value_semantics =
             HashMap::from([(TypeId::of::<FrameIndex>(), frame_semantics.clone())]);
         let frame = Node::new(
             id,
@@ -60,7 +60,7 @@ impl Graph {
             id,
             nodes,
             frame,
-            value_semantics,
+            default_value_semantics,
             replacement_epoch: 0,
         }
     }
@@ -121,14 +121,59 @@ impl Graph {
         self.insert_computation(ComputationDefinition::<T>::new(Box::new([]), computation))
     }
 
-    /// Uses `T::eq` for nodes of type `T` created after this call.
+    /// Sets `T::eq` as the default equivalence for subsequently created nodes of `T`.
     ///
     /// Existing nodes, including the built-in frame input, retain their semantics.
     /// `Eq` alone does not establish that every downstream closure respects it;
     /// callers must uphold the module's substitution and immutability contracts.
-    pub fn register_eq<T: Eq + 'static>(&mut self) {
-        self.value_semantics
+    pub fn set_default_eq<T: Eq + 'static>(&mut self) {
+        self.default_value_semantics
             .insert(TypeId::of::<T>(), ValueSemantics::by_eq::<T>());
+    }
+
+    /// Sets the default equivalence for subsequently created nodes of `T`.
+    ///
+    /// Existing nodes retain their semantics, including after replacement. The
+    /// comparator must be stable, reflexive, symmetric and transitive; published
+    /// values must be semantically immutable, and every downstream computation
+    /// must permit substituting equivalent inputs. General tolerance comparisons
+    /// usually violate these requirements and must not be used as cache equality.
+    /// Shared-object identity always counts as equivalent without invoking `f`.
+    ///
+    /// ```
+    /// use gekijyou::computation::Graph;
+    /// let mut graph = Graph::new();
+    /// graph.set_default_equivalence::<f64, _>(|a, b| a.to_bits() == b.to_bits());
+    /// let input = graph.input::<f64>();
+    /// ```
+    pub fn set_default_equivalence<T: 'static, F>(&mut self, f: F)
+    where
+        F: Fn(&T, &T) -> bool + Send + Sync + 'static,
+    {
+        self.default_value_semantics
+            .insert(TypeId::of::<T>(), ValueSemantics::by_equivalence::<T, F>(f));
+    }
+
+    /// Configures persistent result retention for a computation node.
+    ///
+    /// Validates graph ownership, existence and type. Does not change the node's
+    /// definition, revision or the graph's replacement epoch. Each evaluator
+    /// applies the latest policy lazily on the next visit, discarding that node's
+    /// entries when its applied policy differs in variant or capacity, including
+    /// `Last` to `Lru { capacity: 1 }`. Reapplying the same policy retains entries.
+    /// External inputs always read the current Context; configuring them returns
+    /// [`GraphError::InputNodeCachePolicy`] without changing any metadata.
+    pub fn set_cache_policy<T: 'static>(
+        &mut self,
+        node: Node<T>,
+        policy: CachePolicy,
+    ) -> Result<(), GraphError> {
+        self.check_node(node.graph_id, node.id, TypeId::of::<T>())?;
+        if matches!(self.nodes[node.id].kind, NodeKind::Input) {
+            return Err(GraphError::InputNodeCachePolicy { node: node.id });
+        }
+        self.nodes[node.id].cache_policy = policy;
+        Ok(())
     }
 
     /// Replaces a computation's closure and inputs, preserving its typed handle.
@@ -175,7 +220,7 @@ impl Graph {
             revision: 0,
             kind,
             semantics: self
-                .value_semantics
+                .default_value_semantics
                 .get(&TypeId::of::<T>())
                 .cloned()
                 .unwrap_or_default(),

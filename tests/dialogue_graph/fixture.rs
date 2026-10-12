@@ -70,16 +70,16 @@ pub(super) struct DialogueGraph {
 impl DialogueGraph {
     pub(super) fn new() -> Self {
         let mut graph = Graph::new();
-        graph.register_eq::<i64>();
-        graph.register_eq::<u64>();
-        graph.register_eq::<Scene>();
+        graph.set_default_eq::<i64>();
+        graph.set_default_eq::<u64>();
+        graph.set_default_eq::<Scene>();
 
         let frame = graph.frame();
         let canvas_width = graph.input::<i64>();
         let origin = graph.input::<i64>();
         let dialogue = graph.input::<String>();
         // Dialogue keeps identity semantics; later String nodes get content equality.
-        graph.register_eq::<String>();
+        graph.set_default_eq::<String>();
 
         let step = graph.constant(20_i64);
         let gap = graph.constant(160_i64);

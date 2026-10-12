@@ -40,13 +40,17 @@ fn dependencies_beyond_inline_capacity_preserve_order_and_repeated_values() {
     let b = graph.constant(Value(7));
     let c = graph.constant(Value(3));
     let target = graph.map(FiveInputs([b, a, b, c, a]), ());
-    let mut batch = RequestBatch::new(&graph);
-    let context = batch.add_context(Context::new(&graph)).unwrap();
-    let request = batch.request(context, target).unwrap();
-    let results = Evaluator::new(&graph)
-        .evaluate_batch(&graph, batch)
-        .unwrap();
-    assert_eq!(results.get(request), Ok(&[7, 2, 7, 3, 2]));
+    let mut evaluator = Evaluator::new(&graph);
+    for _ in 0..2 {
+        let mut batch = RequestBatch::new(&graph);
+        let context = batch.add_context(Context::new(&graph)).unwrap();
+        let request = batch.request(context, target).unwrap();
+        let results = evaluator.evaluate_batch(&graph, batch).unwrap();
+        assert_eq!(results.get(request), Ok(&[7, 2, 7, 3, 2]));
+    }
+    assert_eq!(evaluator.stats().computation_calls, 4);
+    assert_eq!(evaluator.stats().memo_hits, 4);
+    assert_eq!(evaluator.stats().memo_comparisons, 5);
 }
 
 #[test]
@@ -61,13 +65,17 @@ fn erased_output_type_is_checked_before_publishing() {
     }
     let mut graph = Graph::new();
     let node = graph.map(WrongOutput, ());
-    let mut batch = RequestBatch::new(&graph);
-    let context = batch.add_context(Context::new(&graph)).unwrap();
-    batch.request(context, node).unwrap();
-    assert!(
-        matches!(Evaluator::new(&graph).evaluate_batch(&graph, batch),
-        Err(EvalError::Graph(GraphError::TypeMismatch { node: id })) if id == node.id)
-    );
+    let mut evaluator = Evaluator::new(&graph);
+    for _ in 0..2 {
+        let mut batch = RequestBatch::new(&graph);
+        let context = batch.add_context(Context::new(&graph)).unwrap();
+        batch.request(context, node).unwrap();
+        assert!(matches!(evaluator.evaluate_batch(&graph, batch),
+            Err(EvalError::Graph(GraphError::TypeMismatch { node: id })) if id == node.id));
+    }
+    assert_eq!(evaluator.stats().computation_calls, 2);
+    assert_eq!(evaluator.stats().memo_misses, 2);
+    assert_eq!(evaluator.stats().memo_hits, 0);
 }
 
 #[test]

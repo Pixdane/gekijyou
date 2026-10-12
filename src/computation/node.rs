@@ -1,4 +1,4 @@
-use super::value::{Computation, ValueSemantics};
+use super::value::{ErasedComputation, ValueSemantics};
 use slotmap::new_key_type;
 use std::{
     any::TypeId,
@@ -11,7 +11,7 @@ use std::{
 /// Carries no frame rate or time domain. The caller defines conversions to seconds
 /// or local time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Frame(pub u64);
+pub struct FrameIndex(pub u64);
 
 new_key_type! {
     /// A node storage key local to one graph.
@@ -96,7 +96,7 @@ impl GraphId {
 }
 
 /// An input edge recording source ownership and the type expected by the closure.
-pub(super) struct NodeInput {
+pub(super) struct Dependency {
     pub(super) graph_id: GraphId,
     pub(super) source: NodeId,
     pub(super) type_id: TypeId,
@@ -106,14 +106,16 @@ pub(super) struct NodeInput {
 pub(super) enum NodeKind {
     Input,
     Computation {
-        inputs: Box<[NodeInput]>,
-        computation: Box<Computation>,
+        inputs: Box<[Dependency]>,
+        computation: Box<ErasedComputation>,
     },
 }
 
 /// A heterogeneous node record whose output type matches its Node<T> marker.
 pub(super) struct NodeRecord {
     pub(super) type_id: TypeId,
+    /// Successful replacements of this node's computation definition.
+    pub(super) revision: u64,
     pub(super) kind: NodeKind,
     pub(super) semantics: ValueSemantics,
     pub(super) cache_policy: CachePolicy,

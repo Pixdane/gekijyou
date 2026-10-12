@@ -5,7 +5,7 @@ pub(super) type SharedValue = Arc<dyn Any + Send + Sync + 'static>;
 
 /// An erased computation whose arguments must match its input edges in order,
 /// count, and type.
-pub(super) type Computation = dyn Fn(&[&dyn Any]) -> SharedValue + Send + Sync + 'static;
+pub(super) type ErasedComputation = dyn Fn(&[&dyn Any]) -> SharedValue + Send + Sync + 'static;
 
 type Equality = dyn Fn(&dyn Any, &dyn Any) -> bool + Send + Sync + 'static;
 

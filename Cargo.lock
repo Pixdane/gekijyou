@@ -7,6 +7,7 @@ name = "gekijyou"
 version = "0.0.1"
 dependencies = [
  "slotmap",
+ "smallvec",
  "thiserror",
 ]
 
@@ -36,6 +37,12 @@ checksum = "bdd58c3c93c3d278ca835519292445cb4b0d4dc59ccfdf7ceadaab3f8aeb4038"
 dependencies = [
  "version_check",
 ]
+
+[[package]]
+name = "smallvec"
+version = "1.16.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
 
 [[package]]
 name = "syn"

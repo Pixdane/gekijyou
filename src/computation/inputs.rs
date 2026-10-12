@@ -1,6 +1,6 @@
 use super::{
-    node::{Node, NodeInput},
-    value::{Computation, SharedValue},
+    node::{Dependency, Node},
+    value::{ErasedComputation, SharedValue},
 };
 use std::{
     any::{Any, TypeId},
@@ -14,6 +14,31 @@ use std::{
 /// to four nodes. Custom input wrappers can delegate to these implementations.
 /// [`Graph::map`](super::Graph::map) and [`Graph::replace`](super::Graph::replace)
 /// share the same construction step.
+///
+/// Custom adapters wrap the built-in input shapes by delegating definition
+/// construction. The erased representation stays private so adapters preserve
+/// the declared input and output types:
+///
+/// ```
+/// use gekijyou::computation::{ComputationDefinition, ComputationInputs, Graph, Node};
+///
+/// struct Position(Node<i64>, Node<i64>);
+///
+/// impl<F, O> ComputationInputs<F, O> for Position
+/// where
+///     F: Fn(&i64, &i64) -> O + Send + Sync + 'static,
+///     O: Send + Sync + 'static,
+/// {
+///     fn build_computation(&self, f: F) -> ComputationDefinition<O> {
+///         (self.0, self.1).build_computation(f)
+///     }
+/// }
+///
+/// let mut graph = Graph::new();
+/// let x = graph.constant(10_i64);
+/// let y = graph.constant(20_i64);
+/// let point = graph.map(Position(x, y), |x: &i64, y: &i64| (*x, *y));
+/// ```
 pub trait ComputationInputs<F, O> {
     /// Builds a definition without executing the closure or modifying a graph.
     /// Handle ownership and dependencies are checked when the graph inserts or
@@ -53,15 +78,15 @@ pub trait ComputationInputs<F, O> {
 /// graph.validate().unwrap();
 /// ```
 pub struct ComputationDefinition<O> {
-    inputs: Box<[NodeInput]>,
-    computation: Box<Computation>,
+    inputs: Box<[Dependency]>,
+    computation: Box<ErasedComputation>,
     // Require the exact erased output type without owning O or inheriting its auto traits.
     _marker: PhantomData<fn(O) -> O>,
 }
 
 impl<O> ComputationDefinition<O> {
     // Only internal typed adapters construct definitions; the erased closure returns O.
-    pub(super) fn new(inputs: Box<[NodeInput]>, computation: Box<Computation>) -> Self {
+    pub(super) fn new(inputs: Box<[Dependency]>, computation: Box<ErasedComputation>) -> Self {
         Self {
             inputs,
             computation,
@@ -69,7 +94,7 @@ impl<O> ComputationDefinition<O> {
         }
     }
 
-    pub(super) fn into_parts(self) -> (Box<[NodeInput]>, Box<Computation>) {
+    pub(super) fn into_parts(self) -> (Box<[Dependency]>, Box<ErasedComputation>) {
         (self.inputs, self.computation)
     }
 }
@@ -80,7 +105,7 @@ where
     O: Send + Sync + 'static,
 {
     fn build_computation(&self, f: F) -> ComputationDefinition<O> {
-        let computation: Box<Computation> = Box::new(move |args| {
+        let computation: Box<ErasedComputation> = Box::new(move |args| {
             assert!(args.is_empty(), "Invalid input count");
             Arc::new(f()) as SharedValue
         });
@@ -98,15 +123,15 @@ macro_rules! impl_computation_inputs {
         {
             fn build_computation(&self, f: F) -> ComputationDefinition<O> {
                 let ($($node,)+) = self;
-                let inputs: Box<[NodeInput]> = Box::new([
-                    $(NodeInput {
+                let inputs: Box<[Dependency]> = Box::new([
+                    $(Dependency {
                         graph_id: $node.graph_id,
                         source: $node.id,
                         type_id: TypeId::of::<$T>(),
                     },)+
                 ]);
                 // Preserve argument order and multiplicity at the type erasure boundary.
-                let computation: Box<Computation> = Box::new(move |args: &[&dyn Any]| {
+                let computation: Box<ErasedComputation> = Box::new(move |args: &[&dyn Any]| {
                     let [$($arg,)+] = args else {
                         panic!("Invalid input count");
                     };

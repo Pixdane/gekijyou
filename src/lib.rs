@@ -1,3 +1,3 @@
-//! Core construction APIs for Gekijyou. See [`computation`] for graph usage.
+//! Core graph construction and evaluation APIs for Gekijyou. See [`computation`].
 
 pub mod computation;

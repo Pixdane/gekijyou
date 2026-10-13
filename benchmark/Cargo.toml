@@ -33,3 +33,15 @@ version = "0.20.0"
 version = "0.20.0"
 [dependencies.bevy_transform]
 version = "0.20.0"
+
+[dependencies.bevy_tasks]
+version = "0.20.0"
+features = ["multi_threaded"]
+
+[[bin]]
+name = "rework_timing"
+path = "src/bin/rework_timing.rs"
+
+[[bin]]
+name = "rework_allocations"
+path = "src/bin/rework_allocations.rs"

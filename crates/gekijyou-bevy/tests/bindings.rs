@@ -277,3 +277,34 @@ fn plugin_applies_before_transform_propagation() {
         None
     );
 }
+
+#[test]
+fn shared_ecs_inputs_freeze_large_non_clone_objects_without_new_snapshots_on_repeat() {
+    use std::sync::Arc;
+    struct Large(Vec<u8>);
+    #[derive(Component)]
+    struct Source(Arc<Large>);
+    let payload = Arc::new(Large(vec![1; 1024 * 1024]));
+    let mut world = World::new();
+    let entity = world.spawn(Source(payload.clone())).id();
+    let mut runtime = AnimationRuntime::new(1);
+    let input = runtime.edit(|e| Ok(e.input::<Large>())).unwrap();
+    let mut bindings = Bindings::new();
+    bindings
+        .bind_input(
+            runtime.snapshot(),
+            entity,
+            input,
+            InputField::shared(|s: &Source| s.0.clone()),
+        )
+        .unwrap();
+    runtime.sync_inputs(&world, &bindings).unwrap();
+    let snapshot = runtime.snapshot().clone();
+    assert!(Arc::ptr_eq(
+        &payload,
+        &snapshot.get_shared(input).unwrap().unwrap()
+    ));
+    assert_eq!(snapshot.get(input).unwrap().unwrap().0.len(), 1024 * 1024);
+    runtime.sync_inputs(&world, &bindings).unwrap();
+    assert_eq!(runtime.snapshot().id(), snapshot.id());
+}

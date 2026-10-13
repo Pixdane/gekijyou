@@ -84,6 +84,7 @@ version = "0.0.1"
 dependencies = [
  "bevy_ecs",
  "bevy_math",
+ "bevy_tasks",
  "bevy_transform",
  "gekijyou-bevy",
  "gekijyou-computation",
@@ -680,6 +681,7 @@ dependencies = [
 name = "gekijyou-computation"
 version = "0.0.1"
 dependencies = [
+ "rustc-hash 2.1.3",
  "slotmap",
  "smallvec",
  "thiserror",

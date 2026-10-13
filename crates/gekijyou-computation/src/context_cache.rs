@@ -1,5 +1,6 @@
 use super::{Graph, GraphError, NodeId, node::NodeKind, value::SharedValue};
-use std::collections::{HashSet, VecDeque};
+use crate::collections::Set as HashSet;
+use std::collections::VecDeque;
 struct Entry {
     roots: Box<[SharedValue]>,
     output: SharedValue,
@@ -12,7 +13,7 @@ pub(crate) struct NodeContextCache {
 impl NodeContextCache {
     pub(crate) fn new(graph: &Graph, node: NodeId, capacity: usize) -> Result<Self, GraphError> {
         let mut stack = vec![node];
-        let mut visited = HashSet::new();
+        let mut visited = HashSet::default();
         let mut roots = Vec::new();
         while let Some(id) = stack.pop() {
             if !visited.insert(id) {

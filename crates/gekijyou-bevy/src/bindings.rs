@@ -25,6 +25,8 @@ pub enum BindingError {
     MissingEntity,
     #[error("Bound component is missing")]
     MissingComponent,
+    #[error("Enable the async driver exactly once before async preparation")]
+    AsyncConfiguration,
     #[error("Pause playback before publishing graph/input edits")]
     Playing,
     #[error("The complete current snapshot/generation/binding frame is not prepared")]
@@ -45,16 +47,29 @@ impl WriteRange {
 }
 
 type Reader<C, T> = dyn Fn(&C) -> T + Send + Sync;
+type SharedReader<C, T> = dyn Fn(&C) -> Arc<T> + Send + Sync;
+enum InputReader<C, T> {
+    Owned(Arc<Reader<C, T>>),
+    Shared(Arc<SharedReader<C, T>>),
+}
 
 /// Typed ECS extractor; no reflection or dynamic field offsets.
 pub struct InputField<C, T> {
-    read: Arc<Reader<C, T>>,
+    read: InputReader<C, T>,
     range: WriteRange,
 }
 impl<C, T> InputField<C, T> {
     pub fn new(f: impl Fn(&C) -> T + Send + Sync + 'static) -> Self {
         Self {
-            read: Arc::new(f),
+            read: InputReader::Owned(Arc::new(f)),
+            range: WriteRange::Whole,
+        }
+    }
+    /// Freezes an immutable shared resource directly, without deep cloning T or
+    /// creating `Arc<Arc<T>>`. Reusing the same Arc preserves snapshot identity.
+    pub fn shared(f: impl Fn(&C) -> Arc<T> + Send + Sync + 'static) -> Self {
+        Self {
+            read: InputReader::Shared(Arc::new(f)),
             range: WriteRange::Whole,
         }
     }
@@ -167,6 +182,7 @@ pub struct Bindings {
     inputs: Vec<InputEntry>,
     outputs: Vec<OutputEntry>,
     revision: u64,
+    graph: Option<GraphId>,
 }
 impl Bindings {
     pub fn new() -> Self {
@@ -189,6 +205,12 @@ impl Bindings {
         field: InputField<C, T>,
     ) -> Result<(), BindingError> {
         snapshot.get(input)?;
+        if self.graph.is_some_and(|id| id != snapshot.graph_id()) {
+            return Err(GraphError::ForeignNode {
+                node: input.node().id(),
+            }
+            .into());
+        }
         let key = NodeKey::of(input.node());
         let source = Destination {
             entity,
@@ -202,6 +224,7 @@ impl Bindings {
             return Err(BindingError::FeedbackConflict);
         }
         self.advance();
+        self.graph = Some(snapshot.graph_id());
         self.inputs.push(InputEntry {
             key,
             source,
@@ -213,7 +236,10 @@ impl Bindings {
                 let c = world
                     .get::<C>(entity)
                     .ok_or(BindingError::MissingComponent)?;
-                edit.set(input, (field.read)(c))?;
+                match &field.read {
+                    InputReader::Owned(read) => edit.set(input, read(c))?,
+                    InputReader::Shared(read) => edit.set_shared(input, read(c))?,
+                };
                 Ok(())
             }),
         });
@@ -227,6 +253,9 @@ impl Bindings {
         field: OutputField<C, T>,
     ) -> Result<(), BindingError> {
         snapshot.graph().check(node)?;
+        if self.graph.is_some_and(|id| id != snapshot.graph_id()) {
+            return Err(GraphError::ForeignNode { node: node.id() }.into());
+        }
         let target = Destination {
             entity,
             component: TypeId::of::<C>(),
@@ -239,6 +268,7 @@ impl Bindings {
             return Err(BindingError::FeedbackConflict);
         }
         self.advance();
+        self.graph = Some(snapshot.graph_id());
         self.outputs.push(OutputEntry {
             key: NodeKey::of(node),
             target,

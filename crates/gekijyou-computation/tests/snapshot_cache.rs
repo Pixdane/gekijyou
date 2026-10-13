@@ -344,3 +344,51 @@ fn dfs_reports_a_supported_depth_limit_and_can_be_reused() {
         0
     );
 }
+
+#[test]
+fn deleted_cache_detachment_remains_complete_when_a_user_destructor_panics() {
+    struct PanicDrop(Arc<AtomicBool>);
+    impl Drop for PanicDrop {
+        fn drop(&mut self) {
+            assert!(!self.0.swap(false, Ordering::Relaxed), "evicted destructor");
+        }
+    }
+    let panic = Arc::new(AtomicBool::new(false));
+    let mut state = GraphState::new();
+    let nodes = state
+        .edit(|e| {
+            (0..2)
+                .map(|_| {
+                    let panic = panic.clone();
+                    e.map((), move || PanicDrop(panic.clone()))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap();
+    let mut eval = Evaluator::new(&state);
+    for &node in &nodes {
+        drop(
+            eval.bind(state.snapshot())
+                .unwrap()
+                .sample(FrameIndex(0), node)
+                .unwrap(),
+        );
+    }
+    state
+        .edit(|e| {
+            for &node in &nodes {
+                e.remove(node)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    panic.store(true, Ordering::Relaxed);
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            eval.bind(state.snapshot()).unwrap();
+        }))
+        .is_err()
+    );
+    assert_eq!(eval.cache_stats().memo_entries, 0);
+    eval.bind(state.snapshot()).unwrap();
+}

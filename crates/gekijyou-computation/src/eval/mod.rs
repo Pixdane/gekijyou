@@ -6,8 +6,9 @@ use super::{
     node::{NodeKind, NodeRecord},
     value::SharedValue,
 };
+use crate::collections::Map as HashMap;
 use smallvec::SmallVec;
-use std::{any::Any, collections::HashMap, sync::Arc};
+use std::{any::Any, sync::Arc};
 
 /// Cumulative actual work, independent of the lifetime of returned results.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -141,9 +142,15 @@ impl Evaluator {
             self.stats.definition_syncs += 1;
             // Revision synchronization is also checked on lookup/commit. Remove
             // dead nodes now to release their retained values and configuration.
-            self.cache
-                .memo
-                .retain(|id, _| self.graph.nodes.contains_key(id));
+            let old_memo = std::mem::take(&mut self.cache.memo);
+            let mut discarded = Vec::new();
+            for (id, cache) in old_memo {
+                if self.graph.nodes.contains_key(&id) {
+                    self.cache.memo.insert(id, cache);
+                } else {
+                    discarded.push(cache);
+                }
+            }
             self.cache
                 .config
                 .retain(|id, _| self.graph.nodes.contains_key(id));
@@ -153,7 +160,7 @@ impl Evaluator {
                     self.cache.config.get(&id).copied().unwrap_or_default().memo,
                 );
             }
-            drop(old_context);
+            drop((old_context, discarded));
         }
         Ok(EvaluationScope {
             snapshot,

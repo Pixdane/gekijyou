@@ -4,8 +4,9 @@ use super::{
     node::{GraphDefinitionEpoch, NodeKind, next_id},
     value::ErasedComputation,
 };
+use crate::collections::{Map as HashMap, Set as HashSet};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::VecDeque,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, atomic::AtomicU64},
 };
@@ -111,6 +112,9 @@ pub struct ComputeCompletion {
     result: Result<SharedValue, EvalError>,
 }
 impl ComputeCompletion {
+    pub fn failure(&self) -> Option<EvalError> {
+        self.result.as_ref().err().copied()
+    }
     pub fn id(&self) -> ComputeTaskId {
         self.id
     }
@@ -578,7 +582,7 @@ impl Evaluator {
         for r in &batch.requests {
             snapshot.graph.check_node(r.graph, r.node, r.ty)?;
         }
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let frames = batch
             .requests
             .iter()

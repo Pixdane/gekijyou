@@ -61,10 +61,13 @@ impl PreparedResults {
         self.snapshot = snapshot;
         self.generation = generation;
         self.binding = binding;
-        self.frames.clear();
+        let old_frames = std::mem::take(&mut self.frames);
         self.order.clear();
         self.states.clear();
+        drop(old_frames);
     }
+    /// Status of this stored result set. Use AnimationRuntime::frame_status to
+    /// include current binding requirements when deciding whether to apply.
     pub fn status(&self, frame: FrameIndex) -> FrameStatus {
         if self.frames.contains_key(&frame) {
             FrameStatus::Ready
@@ -142,6 +145,7 @@ pub struct AnimationRuntime {
     frame: FrameIndex,
     prepared: PreparedResults,
     pub(crate) last_error: Option<BindingError>,
+    asynchronous: Option<AsyncPreparation>,
 }
 impl AnimationRuntime {
     pub fn new(buffer_frames: usize) -> Self {
@@ -159,6 +163,7 @@ impl AnimationRuntime {
             frame: FrameIndex(0),
             prepared,
             last_error: None,
+            asynchronous: None,
         }
     }
     pub fn snapshot(&self) -> &EvaluationSnapshot {
@@ -175,6 +180,16 @@ impl AnimationRuntime {
     }
     pub fn prepared(&self) -> &PreparedResults {
         &self.prepared
+    }
+    /// Current snapshot/generation/binding readiness, without performing evaluation.
+    pub fn frame_status(&self, bindings: &Bindings, frame: FrameIndex) -> FrameStatus {
+        if self.prepared.snapshot != self.snapshot.id()
+            || self.prepared.generation != self.generation
+            || self.prepared.binding != bindings.revision()
+        {
+            return FrameStatus::Missing;
+        }
+        self.prepared.status(frame)
     }
     pub fn last_error(&self) -> Option<BindingError> {
         self.last_error
@@ -194,6 +209,14 @@ impl AnimationRuntime {
     fn invalidate(&mut self) {
         self.generation = self.generation.next();
         self.prepared.reset(self.snapshot.id(), self.generation, 0);
+        if let Some(asynchronous) = &mut self.asynchronous {
+            asynchronous
+                .driver
+                .cancel(self.snapshot.clone(), self.generation)
+                .expect("Runtime definitions only advance");
+            asynchronous.requests.clear();
+            asynchronous.frames.clear();
+        }
     }
     pub fn play(&mut self) {
         self.invalidate();
@@ -239,6 +262,27 @@ impl AnimationRuntime {
         bindings: &Bindings,
         frames: &[FrameIndex],
     ) -> Result<(), BindingError> {
+        self.prepare_backend(bindings, frames, None).map(|_| ())
+    }
+    /// Optional planned synchronous preparation, using either serial or Bevy executor.
+    pub fn prepare_planned(
+        &mut self,
+        bindings: &Bindings,
+        frames: &[FrameIndex],
+        config: gekijyou_computation::PlannerConfig,
+        executor: &mut impl gekijyou_computation::Executor,
+    ) -> Result<gekijyou_computation::PlannerStats, BindingError> {
+        self.prepare_backend(bindings, frames, Some((config, executor)))
+    }
+    fn prepare_backend(
+        &mut self,
+        bindings: &Bindings,
+        frames: &[FrameIndex],
+        backend: Option<(
+            gekijyou_computation::PlannerConfig,
+            &mut dyn gekijyou_computation::Executor,
+        )>,
+    ) -> Result<gekijyou_computation::PlannerStats, BindingError> {
         if self.prepared.binding != bindings.revision() {
             self.prepared
                 .reset(self.snapshot.id(), self.generation, bindings.revision());
@@ -250,10 +294,18 @@ impl AnimationRuntime {
         // changed to failure even when the caller catches the original panic.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let (batch, requests) = bindings.plan(&self.snapshot, frames)?;
-            let results = self
-                .evaluator
-                .bind(self.snapshot.clone())?
-                .evaluate(batch)?;
+            let (results, stats) = match backend {
+                Some((config, executor)) => self
+                    .evaluator
+                    .bind(self.snapshot.clone())?
+                    .evaluate_planned(batch, config, executor)?,
+                None => (
+                    self.evaluator
+                        .bind(self.snapshot.clone())?
+                        .evaluate(batch)?,
+                    gekijyou_computation::PlannerStats::default(),
+                ),
+            };
             let mut complete: HashMap<FrameIndex, HashMap<NodeKey, SharedValue>> =
                 frames.iter().map(|&f| (f, HashMap::new())).collect();
             for request in requests {
@@ -262,17 +314,17 @@ impl AnimationRuntime {
                     .unwrap()
                     .insert(request.key, (request.read)(&results)?);
             }
-            Ok::<_, BindingError>(complete)
+            Ok::<_, BindingError>((complete, stats))
         }));
         match result {
-            Ok(Ok(mut complete)) => {
+            Ok(Ok((mut complete, stats))) => {
                 for &frame in frames {
                     if let Some(values) = complete.remove(&frame) {
                         self.prepared.install(frame, values);
                     }
                 }
                 self.last_error = None;
-                Ok(())
+                Ok(stats)
             }
             Ok(Err(error)) => {
                 for &frame in frames {
@@ -325,5 +377,132 @@ impl AnimationRuntime {
 impl Default for AnimationRuntime {
     fn default() -> Self {
         Self::new(8)
+    }
+}
+
+struct AsyncPreparation {
+    driver: crate::AsyncDriver,
+    requests: Vec<crate::bindings::PlannedOutput>,
+    frames: Vec<FrameIndex>,
+    binding: u64,
+}
+impl AnimationRuntime {
+    /// Installs one persistent cross-generation quota tracker. Reinstalling would
+    /// forget canceled running workers, so it is rejected rather than resetting it.
+    pub fn enable_async(&mut self, limits: crate::TaskLimits) -> Result<(), BindingError> {
+        if self.asynchronous.is_some() || limits.max_in_flight == 0 {
+            return Err(BindingError::AsyncConfiguration);
+        }
+        self.asynchronous = Some(AsyncPreparation {
+            driver: crate::AsyncDriver::new(self.snapshot.clone(), self.generation, limits),
+            requests: Vec::new(),
+            frames: Vec::new(),
+            binding: 0,
+        });
+        Ok(())
+    }
+    /// Replaces the current playback request without waiting for old workers.
+    /// All cache queries and dependency expansion remain on the polling coordinator.
+    pub fn begin_prepare(
+        &mut self,
+        bindings: &Bindings,
+        frames: &[FrameIndex],
+        config: gekijyou_computation::PlannerConfig,
+    ) -> Result<(), BindingError> {
+        if self.asynchronous.is_none() {
+            return Err(BindingError::AsyncConfiguration);
+        }
+        self.invalidate();
+        self.prepared
+            .reset(self.snapshot.id(), self.generation, bindings.revision());
+        let (batch, requests) = bindings.plan(&self.snapshot, frames)?;
+        let asynchronous = self.asynchronous.as_mut().unwrap();
+        asynchronous.driver.begin(
+            &mut self.evaluator,
+            self.snapshot.clone(),
+            self.generation,
+            batch,
+            config,
+        )?;
+        asynchronous.requests = requests;
+        asynchronous.frames = frames.to_vec();
+        asynchronous.binding = bindings.revision();
+        for &frame in frames {
+            self.prepared.state(frame, FrameStatus::Pending);
+        }
+        self.last_error = None;
+        Ok(())
+    }
+    /// Nonblocking progress. Obsolete worker messages are reclaimed even when no
+    /// current frame is awaiting preparation. Ready means the required set is complete.
+    pub fn poll_prepare(
+        &mut self,
+        pool: &bevy_tasks::TaskPool,
+        bindings: &Bindings,
+    ) -> Result<bool, BindingError> {
+        let Some(asynchronous) = self.asynchronous.as_mut() else {
+            return Err(BindingError::AsyncConfiguration);
+        };
+        if asynchronous.binding != bindings.revision() && !asynchronous.frames.is_empty() {
+            self.invalidate();
+            return Err(BindingError::FrameNotReady);
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            asynchronous.driver.poll(&mut self.evaluator, pool)
+        }));
+        match result {
+            Ok(Ok(None)) => Ok(false),
+            Ok(Ok(Some((results, _stats)))) => {
+                if results.snapshot_id() != self.snapshot.id()
+                    || asynchronous.driver.generation() != self.generation
+                {
+                    return Ok(false);
+                }
+                let mut complete: HashMap<FrameIndex, HashMap<NodeKey, SharedValue>> = asynchronous
+                    .frames
+                    .iter()
+                    .map(|&f| (f, HashMap::new()))
+                    .collect();
+                for request in &asynchronous.requests {
+                    complete
+                        .get_mut(&request.frame)
+                        .unwrap()
+                        .insert(request.key, (request.read)(&results)?);
+                }
+                for frame in std::mem::take(&mut asynchronous.frames) {
+                    if let Some(values) = complete.remove(&frame) {
+                        self.prepared.install(frame, values);
+                    }
+                }
+                asynchronous.requests.clear();
+                self.last_error = None;
+                Ok(true)
+            }
+            Ok(Err(error)) => {
+                for frame in std::mem::take(&mut asynchronous.frames) {
+                    self.prepared.state(frame, FrameStatus::Failed);
+                }
+                asynchronous.requests.clear();
+                let error = BindingError::Evaluation(error);
+                self.last_error = Some(error);
+                Err(error)
+            }
+            Err(panic) => {
+                for frame in std::mem::take(&mut asynchronous.frames) {
+                    self.prepared.state(frame, FrameStatus::Failed);
+                }
+                asynchronous.requests.clear();
+                std::panic::resume_unwind(panic)
+            }
+        }
+    }
+    pub fn async_task_stats(&mut self) -> Option<crate::TaskStats> {
+        self.asynchronous.as_mut().map(|a| a.driver.stats())
+    }
+    pub fn async_in_flight(&mut self) -> usize {
+        self.asynchronous
+            .as_mut()
+            .map(|a| a.driver.in_flight())
+            .unwrap_or(0)
     }
 }

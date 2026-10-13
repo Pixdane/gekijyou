@@ -8,7 +8,7 @@ use std::{
     sync::Arc,
 };
 
-/// Ordered typed dependencies: (), Node<T>, or tuples of one to four Nodes.
+/// Ordered typed dependencies: `()`, `Node<T>`, or tuples of one to four Nodes.
 /// Custom adapters delegate to these shapes, preserving the erased output type.
 pub trait ComputationInputs<F, O> {
     /// Builds a definition without executing the closure or modifying a graph.

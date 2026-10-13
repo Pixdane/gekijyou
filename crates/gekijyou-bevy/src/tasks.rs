@@ -35,7 +35,7 @@ struct Session {
     snapshot: SnapshotId,
     generation: RuntimeGeneration,
 }
-type Job<R> = Box<dyn FnOnce(EvaluationSnapshot) -> R + Send>;
+type Job<R> = Box<dyn FnOnce(EvaluationSnapshot) -> Result<R, EvalError> + Send>;
 struct Queued<R> {
     id: TaskId,
     session: Session,
@@ -106,6 +106,10 @@ impl<R: Send + 'static> TaskCoordinator<R> {
             limits.max_in_flight > 0,
             "At least one worker slot is required"
         );
+        limits
+            .max_in_flight
+            .checked_add(limits.max_pending)
+            .expect("Task quota overflow");
         let (sender, receiver) = mpsc::channel();
         Self {
             snapshot,
@@ -124,6 +128,11 @@ impl<R: Send + 'static> TaskCoordinator<R> {
             snapshot: self.snapshot.id(),
             generation: self.generation,
         }
+    }
+    pub fn available(&self) -> usize {
+        self.limits.max_in_flight + self.limits.max_pending
+            - self.running.len()
+            - self.pending.len()
     }
     pub fn in_flight(&self) -> usize {
         self.running.len()
@@ -151,6 +160,14 @@ impl<R: Send + 'static> TaskCoordinator<R> {
         &mut self,
         pool: &TaskPool,
         job: impl FnOnce(EvaluationSnapshot) -> R + Send + 'static,
+    ) -> Option<TaskId> {
+        self.submit_fallible(pool, move |snapshot| Ok(job(snapshot)))
+    }
+    /// Explicit task failures follow the same one-terminal-state quota protocol.
+    pub fn submit_fallible(
+        &mut self,
+        pool: &TaskPool,
+        job: impl FnOnce(EvaluationSnapshot) -> Result<R, EvalError> + Send + 'static,
     ) -> Option<TaskId> {
         if self.running.len() >= self.limits.max_in_flight
             && self.pending.len() >= self.limits.max_pending
@@ -189,14 +206,22 @@ impl<R: Send + 'static> TaskCoordinator<R> {
         }
         self.snapshot = snapshot;
         self.generation = generation;
+        self.cancel();
+        Ok(())
+    }
+    /// Cancel queued jobs and mark running jobs obsolete without releasing quota.
+    pub fn cancel(&mut self) {
         let pending = std::mem::take(&mut self.pending);
         self.stats.canceled_pending += pending.len() as u64;
         for running in self.running.values_mut() {
             running.canceled = true;
         }
         drop(pending);
-        Ok(())
     }
+    pub fn dispatch_pending(&mut self, pool: &TaskPool) {
+        self.dispatch(pool);
+    }
+
     fn dispatch(&mut self, pool: &TaskPool) {
         while self.running.len() < self.limits.max_in_flight {
             let Some(queued) = self.pending.pop_front() else {
@@ -221,7 +246,7 @@ impl<R: Send + 'static> TaskCoordinator<R> {
             self.stats.peak_in_flight = self.stats.peak_in_flight.max(self.running.len());
             pool.spawn(async move {
                 let result = catch_unwind(AssertUnwindSafe(|| (queued.job)(queued.snapshot)))
-                    .map_err(|_| EvalError::WorkerPanicked);
+                    .unwrap_or(Err(EvalError::WorkerPanicked));
                 guard.finish(result);
             })
             .detach();
@@ -231,6 +256,13 @@ impl<R: Send + 'static> TaskCoordinator<R> {
     /// terminal messages cannot release a slot twice. Panicking user destructors
     /// therefore do not strand a running ticket or roll back the active session.
     pub fn poll(&mut self, pool: &TaskPool) -> Vec<FinishedTask<R>> {
+        let finished = self.poll_completions();
+        self.dispatch(pool);
+        finished
+    }
+    /// Separate terminal processing lets a planner cancel successors on failure
+    /// before any queued work is dispatched.
+    pub fn poll_completions(&mut self) -> Vec<FinishedTask<R>> {
         let mut finished = Vec::new();
         while let Ok(completed) = self.receiver.try_recv() {
             let Some(running) = self.running.remove(&completed.id) else {
@@ -254,7 +286,6 @@ impl<R: Send + 'static> TaskCoordinator<R> {
                 result: completed.result,
             });
         }
-        self.dispatch(pool);
         finished
     }
 }

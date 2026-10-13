@@ -1,14 +1,14 @@
-//! Typed computation graphs for animation sampling.
+//! Frozen P3.5 baseline for historical regression tests and benchmarks.
 //!
-//! [`Graph`] defines nodes and their explicit dependencies. [`Context`] supplies
-//! external inputs for one sample. [`RequestBatch`] groups contexts and targets;
-//! [`Evaluator`] evaluates them serially, sharing dependencies within each context
+//! [`Graph`](crate::p35::Graph) defines nodes and their explicit dependencies. [`Context`](crate::p35::Context) supplies
+//! external inputs for one sample. [`RequestBatch`](crate::p35::RequestBatch) groups contexts and targets;
+//! [`Evaluator`](crate::p35::Evaluator) evaluates them serially, sharing dependencies within each context
 //! and retaining node-local memo results across contexts and batches.
-//! [`BatchResults`] owns the requested outputs independently of the graph.
+//! [`BatchResults`](crate::p35::BatchResults) owns the requested outputs independently of the graph.
 //!
 //! # Build and evaluate
 //!
-//! Each graph starts with a [`FrameIndex`] input. [`Graph::map`] registers a closure
+//! Each graph starts with a [`FrameIndex`](crate::p35::FrameIndex) input. [`Graph::map`](crate::p35::Graph::map) registers a closure
 //! without executing it; [`Node<T>`] is a copyable handle to its typed output.
 //! Context assignments freeze when ownership transfers to a batch:
 //!
@@ -29,8 +29,8 @@
 //! ```
 //!
 //! Inputs can be a single node, a tuple of one to four nodes, or `()` for a
-//! zero-input computation. [`Graph::input`] declares another external input;
-//! [`Graph::constant`] stores a shared value without requiring `Clone`:
+//! zero-input computation. [`Graph::input`](crate::p35::Graph::input) declares another external input;
+//! [`Graph::constant`](crate::p35::Graph::constant) stores a shared value without requiring `Clone`:
 //!
 //! ```
 //! use gekijyou_computation::p35::{FrameIndex, Graph};
@@ -48,16 +48,16 @@
 //! # Identity, edits and failures
 //!
 //! A node belongs to the graph that created it. Passing a foreign handle to
-//! `map` panics before insertion. [`Graph::replace`] preserves the handle while
+//! `map` panics before insertion. [`Graph::replace`](crate::p35::Graph::replace) preserves the handle while
 //! changing its closure and dependencies, rejecting cycles before committing.
-//! [`Graph::validate`] checks ownership, types, references and cycles.
+//! [`Graph::validate`](crate::p35::Graph::validate) checks ownership, types, references and cycles.
 //!
 //! Contexts, batches and evaluators bind only graph identity. Batches use the
 //! definitions present when evaluation starts; existing results retain their old
-//! values across later edits. Each [`RequestId`] reads only its own batch's results.
+//! values across later edits. Each [`RequestId`](crate::p35::RequestId) reads only its own batch's results.
 //!
 //! Every target is validated before any closure executes. Missing inputs produce
-//! [`EvalError::MissingInput`] only when reached. Evaluation errors return no partial
+//! [`EvalError::MissingInput`](crate::p35::EvalError::MissingInput) only when reached. Evaluation errors return no partial
 //! results; computation panics unwind normally. The evaluator can be reused after
 //! either kind of failure. Recursive traversal has a finite stack-depth limit.
 //!
@@ -68,16 +68,16 @@
 //! must remain semantically immutable, including values with interior mutability.
 //! Allocation addresses and reference counts are not stable computation inputs.
 //!
-//! Values default to shared-object identity comparison. [`Graph::set_default_eq`]
-//! and [`Graph::set_default_equivalence`] configure comparison for subsequently
+//! Values default to shared-object identity comparison. [`Graph::set_default_eq`](crate::p35::Graph::set_default_eq)
+//! and [`Graph::set_default_equivalence`](crate::p35::Graph::set_default_equivalence) configure comparison for subsequently
 //! created nodes of a type; existing nodes retain their semantics, including after
-//! replacement. The built-in [`FrameIndex`] starts with content comparison.
+//! replacement. The built-in [`FrameIndex`](crate::p35::FrameIndex) starts with content comparison.
 //! Equality must be a stable equivalence relation and permit substitution
 //! in every downstream computation. Approximate comparisons that violate these laws
 //! cannot serve as general cache equality. Floating-point bitwise distinctions,
 //! including positive and negative zero, can use a comparator based on `to_bits()`.
 //!
-//! [`Context::set`] creates a fresh stored shared object for each assignment. Equal
+//! [`Context::set`](crate::p35::Context::set) creates a fresh stored shared object for each assignment. Equal
 //! scalar inputs need content equivalence for reuse across contexts. For an
 //! `Arc<Resource>` value, use the caller's resource identity explicitly:
 //!
@@ -107,10 +107,10 @@
 //!
 //! # Cache policy and statistics
 //!
-//! Computations default to [`CachePolicy::Last`], retaining one input combination.
-//! [`CachePolicy::Lru`] retains bounded history with LRU eviction. [`CachePolicy::Transient`]
+//! Computations default to [`CachePolicy::Last`](crate::p35::CachePolicy::Last), retaining one input combination.
+//! [`CachePolicy::Lru`](crate::p35::CachePolicy::Lru) retains bounded history with LRU eviction. [`CachePolicy::Transient`](crate::p35::CachePolicy::Transient)
 //! and `Lru { capacity: 0 }` retain no persistent entries; within-context sharing
-//! remains available. [`Graph::set_cache_policy`] applies lazily on the next visit,
+//! remains available. [`Graph::set_cache_policy`](crate::p35::Graph::set_cache_policy) applies lazily on the next visit,
 //! clearing only that node's history when the applied policy changes.
 //! A variant or capacity change clears history, even `Last` to `Lru { capacity: 1 }`.
 //! Input nodes always read the current context and reject cache policy configuration.
@@ -121,11 +121,11 @@
 //! Cached inputs and outputs are shared Arcs and need not implement `Clone`.
 //! A constant's closure retains its value regardless of cache policy.
 //!
-//! [`Evaluator::stats`] reads cumulative [`EvalStats`]; [`Evaluator::reset_stats`]
+//! [`Evaluator::stats`](crate::p35::Evaluator::stats) reads cumulative [`EvalStats`](crate::p35::EvalStats); [`Evaluator::reset_stats`](crate::p35::Evaluator::reset_stats)
 //! resets counters without clearing memo. Successful pure-function entries survive
 //! later errors and panics in the same batch.
 //!
-//! Context caches are independently opt-in through [`Graph::set_context_cache_capacity`].
+//! Context caches are independently opt-in through [`Graph::set_context_cache_capacity`](crate::p35::Graph::set_context_cache_capacity).
 //! Zero disables them by default; positive capacity retains bounded LRU history.
 //! They compare only the transitive external Input ancestors, using each input's
 //! frozen semantics. Zero-input computations contribute no external roots. Hits

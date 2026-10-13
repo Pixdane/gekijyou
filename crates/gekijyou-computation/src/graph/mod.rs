@@ -8,9 +8,10 @@ use super::{
     snapshot::{EvaluationSnapshot, InputData, SnapshotId},
     value::{SharedValue, ValueSemantics},
 };
+use crate::collections::Map as HashMap;
 use std::{
     any::TypeId,
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     sync::{Arc, atomic::AtomicU64},
 };
 
@@ -38,9 +39,9 @@ impl Graph {
         };
         Self {
             id,
-            nodes: HashMap::from([(frame.id, Arc::new(record))]),
+            nodes: [(frame.id, Arc::new(record))].into_iter().collect(),
             frame,
-            defaults: HashMap::new(),
+            defaults: HashMap::default(),
             epoch: GraphDefinitionEpoch(0),
             allocator: Arc::new(AtomicU64::new(1)),
         }
@@ -98,8 +99,8 @@ impl Graph {
         if !matches!(self.node_record(self.frame.id)?.kind, NodeKind::Frame) {
             return Err(GraphError::InvalidFrame);
         }
-        let mut pending = HashMap::new();
-        let mut children: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+        let mut pending = HashMap::default();
+        let mut children: HashMap<NodeId, Vec<NodeId>> = HashMap::default();
         let mut ready = VecDeque::new();
         for (&id, record) in &self.nodes {
             let inputs = match &record.kind {
@@ -193,7 +194,7 @@ impl GraphState {
     pub fn new() -> Self {
         Self {
             graph: Arc::new(Graph::new()),
-            inputs: Arc::new(HashMap::new()),
+            inputs: Arc::new(HashMap::default()),
             snapshot_id: SnapshotId::new(),
         }
     }
@@ -427,4 +428,38 @@ pub(crate) fn check_input<T: 'static>(graph: &Graph, input: Input<T>) -> Result<
         return Err(GraphError::NotInput { node: input.0.id });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn exhausted_epoch_and_revision_cannot_publish_or_wrap() {
+        let mut state = GraphState::new();
+        let node = state.edit(|e| Ok(e.constant(1_u64))).unwrap();
+        Arc::make_mut(
+            Arc::make_mut(&mut state.graph)
+                .nodes
+                .get_mut(&node.id)
+                .unwrap(),
+        )
+        .revision = u64::MAX;
+        let old = state.snapshot().id();
+        assert_eq!(
+            state.edit(|e| e.replace(node, (), || 2_u64)),
+            Err(GraphError::RevisionExhausted { node: node.id })
+        );
+        assert_eq!(state.snapshot().id(), old);
+        Arc::make_mut(&mut state.graph).epoch = GraphDefinitionEpoch(u64::MAX);
+        let mut leaked = None;
+        assert_eq!(
+            state.edit(|e| {
+                leaked = Some(e.input::<u64>());
+                Ok(())
+            }),
+            Err(GraphError::DefinitionEpochExhausted)
+        );
+        assert_eq!(state.snapshot().id(), old);
+        assert!(state.graph().check(leaked.unwrap().node()).is_err());
+    }
 }

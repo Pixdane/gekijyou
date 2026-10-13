@@ -8,6 +8,7 @@ license.workspace = true
 slotmap.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true
+rustc-hash = "2.1.3"
 
 [features]
 p35-baseline = []

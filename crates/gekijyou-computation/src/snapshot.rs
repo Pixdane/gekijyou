@@ -2,10 +2,8 @@ use super::{
     Graph, GraphDefinitionEpoch, GraphError, GraphId, Input, Node, NodeId, graph::check_input,
     node::next_id, value::SharedValue,
 };
-use std::{
-    collections::HashMap,
-    sync::{Arc, atomic::AtomicU64},
-};
+use crate::collections::Map as HashMap;
+use std::sync::{Arc, atomic::AtomicU64};
 pub(crate) type InputData = HashMap<NodeId, SharedValue>;
 
 /// Unique identity of a published calculation basis; clones retain it.

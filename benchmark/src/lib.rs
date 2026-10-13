@@ -4,6 +4,7 @@
 //! `allocations` binaries supply different observers to the same runner.
 
 pub mod options;
+pub mod rework;
 pub mod runner;
 pub mod scenario;
 pub mod scene;

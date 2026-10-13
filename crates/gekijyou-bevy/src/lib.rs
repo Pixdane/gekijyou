@@ -9,3 +9,5 @@ pub use runtime::{
 };
 mod plugin;
 pub use plugin::{AnimationPlugin, AnimationSet};
+mod tasks;
+pub use tasks::{FinishedTask, TaskCoordinator, TaskId, TaskLimits, TaskStats, TaskStatus};

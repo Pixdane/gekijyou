@@ -1,266 +1,427 @@
 use super::{
-    batch::{BatchResults, ContextId, RequestBatch},
+    CachePolicy, EvalError, EvaluationResults, EvaluationSnapshot, FrameIndex, Graph, GraphError,
+    GraphState, Node, NodeCacheConfig, NodeId, RequestBatch,
     cache::NodeCache,
-    context::Context,
     context_cache::NodeContextCache,
-    error::{EvalError, GraphError},
-    graph::Graph,
-    node::{GraphId, NodeId, NodeKind},
+    node::{NodeKind, NodeRecord},
     value::SharedValue,
 };
-use slotmap::SecondaryMap;
 use smallvec::SmallVec;
-use std::{any::Any, sync::Arc};
+use std::{any::Any, collections::HashMap, sync::Arc};
 
-/// Cumulative evaluation counters for one evaluator, independent of batch results.
+/// Cumulative actual work, independent of the lifetime of returned results.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EvalStats {
-    /// Successful persistent memo reuse; excludes per-context temporary sharing.
     pub memo_hits: u64,
-    /// Persistent lookups that completed without a match, including empty caches.
     pub memo_misses: u64,
-    /// Actual input equivalence checks, including identity checks and short circuits.
     pub memo_comparisons: u64,
-    /// Closure invocations, including those that subsequently panic.
     pub computation_calls: u64,
-    /// Successful external-input projection reuse, excluding direct memo hits.
     pub context_hits: u64,
-    /// Completed projection queries without a match; missing inputs skip queries.
     pub context_misses: u64,
-    /// Actual external-input equivalence checks, including identity comparisons.
     pub context_comparisons: u64,
-    /// Node resolution entries, including temporary sharing and immediate hits.
     pub resolution_visits: u64,
+    pub definition_syncs: u64,
+    pub projection_builds: u64,
+}
+/// Current retained entry counts, not byte sizes of shared objects.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CacheStats {
+    pub memo_entries: usize,
+    pub context_entries: usize,
+}
+#[derive(Default)]
+struct CacheStore {
+    memo: HashMap<NodeId, NodeCache>,
+    context: HashMap<NodeId, NodeContextCache>,
+    config: HashMap<NodeId, NodeCacheConfig>,
+}
+#[derive(Default)]
+struct EvalScratch {
+    values: HashMap<(FrameIndex, NodeId), SharedValue>,
+    frames: HashMap<FrameIndex, SharedValue>,
+}
+impl EvalScratch {
+    fn clear(&mut self) {
+        self.values.clear();
+        self.frames.clear();
+    }
 }
 
-/// Serial, on-demand evaluation of batches bound to one graph identity.
-///
-/// Retains direct-input memo and opt-in external-input projection caches separately.
-/// Revisions, replacement epochs and configurations synchronize lazily. Replacing
-/// a node preserves other nodes' direct memo; context caches conservatively rebuild.
-/// Reusable after errors and computation panics caught by the caller.
-/// Retained input/output Arcs live until eviction, invalidation or evaluator drop.
+/// Sole owner of persistent caches. Binding definitions advances monotonically.
+/// Input-only snapshots preserve both histories and root projections. Snapshot
+/// scopes hold exclusive mutable access; computation closures never see the cache.
 pub struct Evaluator {
-    graph_id: GraphId,
-    caches: SecondaryMap<NodeId, NodeCache>,
-    context_caches: SecondaryMap<NodeId, NodeContextCache>,
+    pub(crate) graph: Arc<Graph>,
+    cache: CacheStore,
+    scratch: EvalScratch,
     stats: EvalStats,
 }
-
 impl Evaluator {
-    /// Creates an evaluator bound to this graph's identity.
-    pub fn new(graph: &Graph) -> Self {
+    pub fn new(state: &GraphState) -> Self {
+        Self::from_snapshot(&state.snapshot())
+    }
+    /// Independent evaluator for offline sampling of an old immutable definition.
+    pub fn from_snapshot(snapshot: &EvaluationSnapshot) -> Self {
         Self {
-            graph_id: graph.id(),
-            caches: SecondaryMap::new(),
-            context_caches: SecondaryMap::new(),
+            graph: snapshot.graph.clone(),
+            cache: CacheStore::default(),
+            scratch: EvalScratch::default(),
             stats: EvalStats::default(),
         }
     }
-
-    /// Returns cumulative counters without changing the cache or counters.
     pub fn stats(&self) -> EvalStats {
         self.stats
     }
-
-    /// Returns previous counters and resets them; retained memo entries are unchanged.
     pub fn reset_stats(&mut self) -> EvalStats {
         std::mem::take(&mut self.stats)
     }
-
-    /// Consumes a batch and evaluates its requests with the graph's current definitions.
-    ///
-    /// Validates every target before executing any closure. Missing external inputs
-    /// are discovered only when reached. Each node is evaluated at most once per
-    /// context in this batch. Direct memo lookup resolves dependencies; enabled
-    /// context caches can return before visiting any dependencies. Repeated context
-    /// hits may compare projections again without invoking any closure.
-    /// Empty batches succeed, and unused contexts do no work.
-    ///
-    /// On error, no partial BatchResults are returned and temporary values are released.
-    /// Successful pure-function memo entries are retained. Computation panics unwind
-    /// normally. Traversal is recursive and does not guarantee arbitrary chain depth.
-    pub fn evaluate_batch(
+    pub fn cache_stats(&self) -> CacheStats {
+        CacheStats {
+            memo_entries: self.cache.memo.values().map(NodeCache::entry_count).sum(),
+            context_entries: self
+                .cache
+                .context
+                .values()
+                .map(NodeContextCache::entry_count)
+                .sum(),
+        }
+    }
+    pub fn clear_cache(&mut self) {
+        // Detach before dropping user-owned values, so unwinding cannot expose a
+        // partially cleared cache as valid on the next call.
+        let memo = std::mem::take(&mut self.cache.memo);
+        let context = std::mem::take(&mut self.cache.context);
+        drop((memo, context));
+    }
+    pub fn configure_cache<T: 'static>(
         &mut self,
-        graph: &Graph,
-        batch: RequestBatch,
-    ) -> Result<BatchResults, EvalError> {
-        if self.graph_id != graph.id() || batch.graph_id != graph.id() {
+        node: Node<T>,
+        config: NodeCacheConfig,
+    ) -> Result<(), GraphError> {
+        self.graph.check(node)?;
+        if !matches!(
+            self.graph.node_record(node.id)?.kind,
+            NodeKind::Computation { .. }
+        ) {
+            return Err(GraphError::NotComputation { node: node.id });
+        }
+        if matches!(config.memo, CachePolicy::Lru { capacity: 0 })
+            || matches!(config.context, CachePolicy::Lru { capacity: 0 })
+        {
+            return Err(GraphError::InvalidCacheCapacity);
+        }
+        let old = self
+            .cache
+            .config
+            .insert(node.id, config)
+            .unwrap_or_default();
+        let memo = (old.memo != config.memo).then(|| self.cache.memo.remove(&node.id));
+        let context = (old.context != config.context).then(|| self.cache.context.remove(&node.id));
+        drop((memo, context));
+        Ok(())
+    }
+    pub fn bind(&mut self, snapshot: EvaluationSnapshot) -> Result<EvaluationScope<'_>, EvalError> {
+        if snapshot.graph_id() != self.graph.id {
             return Err(EvalError::ForeignGraph);
         }
-        for request in &batch.requests {
-            batch.context(request.context)?;
-            graph.check_node(batch.graph_id, request.node, request.type_id)?;
+        if snapshot.definition_epoch() < self.graph.epoch {
+            return Err(EvalError::StaleGraphDefinition {
+                requested: snapshot.definition_epoch(),
+                active: self.graph.epoch,
+            });
         }
-
-        let mut context_values: Vec<SecondaryMap<NodeId, SharedValue>> =
-            batch.contexts.iter().map(|_| SecondaryMap::new()).collect();
-        let mut outputs = Vec::with_capacity(batch.requests.len());
-        for request in &batch.requests {
-            let context = batch.context(request.context)?;
-            let value = self.evaluate_node(
-                graph,
-                context,
-                request.context,
-                &mut context_values[request.context.index],
-                request.node,
-            )?;
-            outputs.push(value);
+        if snapshot.definition_epoch() > self.graph.epoch {
+            let old_context = std::mem::take(&mut self.cache.context);
+            self.graph = snapshot.graph.clone();
+            self.stats.definition_syncs += 1;
+            // Revision synchronization is also checked on lookup/commit. Remove
+            // dead nodes now to release their retained values and configuration.
+            self.cache
+                .memo
+                .retain(|id, _| self.graph.nodes.contains_key(id));
+            self.cache
+                .config
+                .retain(|id, _| self.graph.nodes.contains_key(id));
+            for (&id, cache) in &mut self.cache.memo {
+                cache.synchronize(
+                    self.graph.node_record(id)?.revision,
+                    self.cache.config.get(&id).copied().unwrap_or_default().memo,
+                );
+            }
+            drop(old_context);
         }
-        Ok(BatchResults::new(batch.id, outputs))
+        Ok(EvaluationScope {
+            snapshot,
+            evaluator: self,
+        })
     }
-
-    fn evaluate_node(
+    fn evaluate(
         &mut self,
-        graph: &Graph,
-        context: &Context,
-        context_id: ContextId,
-        values: &mut SecondaryMap<NodeId, SharedValue>,
-        node: NodeId,
-    ) -> Result<SharedValue, EvalError> {
-        self.stats.resolution_visits += 1;
-        if let Some(value) = values.get(node) {
-            return Ok(Arc::clone(value));
+        snapshot: &EvaluationSnapshot,
+        batch: RequestBatch,
+    ) -> Result<EvaluationResults, EvalError> {
+        for request in &batch.requests {
+            snapshot
+                .graph
+                .check_node(request.graph, request.node, request.ty)?;
         }
-        let record = graph.node_record(node)?;
-        // This query precedes dependency traversal. Hits deliberately do not
-        // populate the dense temporary map, which could grow to a large NodeId.
-        if record.context_cache_capacity == 0 {
-            self.context_caches.remove(node);
-        } else {
-            let epoch = graph.replacement_epoch();
-            if self
-                .context_caches
-                .get(node)
-                .is_none_or(|cache| cache.replacement_epoch != epoch)
-            {
-                let cache = NodeContextCache::new(graph, node, record.context_cache_capacity)?;
-                self.context_caches.insert(node, cache);
+        // Scratch ownership is local during traversal. Error/unwind drops all
+        // temporary Arcs; ordinary success/error restores only empty capacity.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let result = (|| {
+            let mut outputs = Vec::with_capacity(batch.len());
+            for request in &batch.requests {
+                let frame = scratch
+                    .frames
+                    .entry(request.frame)
+                    .or_insert_with(|| Arc::new(request.frame))
+                    .clone();
+                outputs.push(self.resolve(
+                    snapshot,
+                    request.frame,
+                    &frame,
+                    request.node,
+                    &mut scratch,
+                    0,
+                )?);
             }
-            let cache = self
-                .context_caches
-                .get_mut(node)
-                .expect("Synchronized context cache");
-            cache.synchronize_capacity(record.context_cache_capacity);
-            // Missing roots must fall back to DFS rather than report an error
-            // here: an earlier dependency may panic before the missing input.
-            if cache
-                .roots
-                .iter()
-                .all(|&root| context.value(root).is_some())
-            {
-                let cached = cache.lookup(|root, previous| {
-                    self.stats.context_comparisons += 1;
-                    let current = context.value(root).expect("Present root input");
-                    Ok::<_, EvalError>(
-                        graph
-                            .node_record(root)?
-                            .semantics
-                            .equivalent(current, previous),
-                    )
-                })?;
-                if let Some(output) = cached {
-                    self.stats.context_hits += 1;
-                    return Ok(output);
-                }
-                self.stats.context_misses += 1;
-            }
+            Ok(batch.finish(snapshot.id(), outputs))
+        })();
+        scratch.clear();
+        self.scratch = scratch;
+        result
+    }
+    fn resolve(
+        &mut self,
+        snapshot: &EvaluationSnapshot,
+        frame: FrameIndex,
+        frame_value: &SharedValue,
+        node: NodeId,
+        scratch: &mut EvalScratch,
+        depth: usize,
+    ) -> Result<SharedValue, EvalError> {
+        const MAX_DEPTH: usize = 256;
+        if depth > MAX_DEPTH {
+            return Err(EvalError::DepthLimit { limit: MAX_DEPTH });
+        }
+        self.stats.resolution_visits += 1;
+        if let Some(value) = scratch.values.get(&(frame, node)) {
+            return Ok(value.clone());
+        }
+        let record = snapshot.graph.node_record(node)?;
+        if let Some(output) = self.context_lookup(snapshot, frame_value, node)? {
+            scratch.values.insert((frame, node), output.clone());
+            return Ok(output);
         }
         let value = match &record.kind {
-            NodeKind::Input => {
-                let value = Arc::clone(context.value(node).ok_or(EvalError::MissingInput {
-                    context: context_id,
-                    node,
-                })?);
-                if value.as_ref().type_id() != record.type_id {
-                    return Err(GraphError::TypeMismatch { node }.into());
-                }
-                value
-            }
+            NodeKind::Frame => frame_value.clone(),
+            NodeKind::Input => snapshot
+                .inputs
+                .get(&node)
+                .cloned()
+                .ok_or(EvalError::MissingInput { frame, node })?,
             NodeKind::Computation {
                 inputs,
                 computation,
             } => {
-                // Keep dependency Arcs alive independently of the mutable result table.
-                // Preserve input order and repeated edges at the erasure boundary.
-                // Inline the common 0–4 input case; larger definitions spill to the heap.
                 let dependencies: SmallVec<[SharedValue; 4]> = inputs
                     .iter()
-                    .map(|input| {
-                        self.evaluate_node(graph, context, context_id, values, input.source)
+                    .map(|i| {
+                        self.resolve(snapshot, frame, frame_value, i.source, scratch, depth + 1)
                     })
                     .collect::<Result<_, _>>()?;
-                // Dependency traversal is complete before borrowing any node cache.
-                let policy = record.cache_policy;
-                let cached = if policy.capacity() == 0 {
-                    if let Some(cache) = self.caches.get_mut(node) {
-                        cache.synchronize(record.revision, policy);
-                    }
-                    None
-                } else {
-                    let cache = self
-                        .caches
-                        .entry(node)
-                        .expect("Valid node key")
-                        .or_insert_with(|| NodeCache::new(record.revision, policy));
-                    cache.synchronize(record.revision, policy);
-                    let cached = cache.lookup(&dependencies, |position, current, previous| {
-                        self.stats.memo_comparisons += 1;
-                        let source = graph.node_record(inputs[position].source)?;
-                        Ok::<_, EvalError>(source.semantics.equivalent(current, previous))
-                    })?;
-                    if cached.is_some() {
-                        self.stats.memo_hits += 1;
-                    } else {
-                        self.stats.memo_misses += 1;
-                    }
-                    cached
-                };
-                if let Some(output) = cached {
+                if let Some(output) =
+                    self.memo_lookup(&snapshot.graph, node, record, &dependencies)?
+                {
                     output
                 } else {
                     let args: SmallVec<[&dyn Any; 4]> = dependencies
                         .iter()
-                        .map(|value| value.as_ref() as &dyn Any)
+                        .map(|v| v.as_ref() as &dyn Any)
                         .collect();
                     self.stats.computation_calls += 1;
                     let output = computation(&args);
-                    // Validate before retaining or publishing a computed result.
                     if output.as_ref().type_id() != record.type_id {
                         return Err(GraphError::TypeMismatch { node }.into());
                     }
-                    if policy.capacity() != 0 {
-                        self.caches
-                            .get_mut(node)
-                            .expect("Synchronized node cache")
-                            .insert(&dependencies, Arc::clone(&output));
-                    }
+                    self.memo_insert(node, record, &dependencies, output.clone());
                     output
                 }
             }
         };
-        if record.context_cache_capacity != 0 {
+        self.context_insert(snapshot, frame_value, node, value.clone());
+        scratch.values.insert((frame, node), value.clone());
+        Ok(value)
+    }
+    pub(crate) fn memo_lookup(
+        &mut self,
+        graph: &Graph,
+        node: NodeId,
+        record: &NodeRecord,
+        inputs: &[SharedValue],
+    ) -> Result<Option<SharedValue>, EvalError> {
+        let policy = self
+            .cache
+            .config
+            .get(&node)
+            .copied()
+            .unwrap_or_default()
+            .memo;
+        if policy == CachePolicy::Off {
+            return Ok(None);
+        }
+        let cache = self
+            .cache
+            .memo
+            .entry(node)
+            .or_insert_with(|| NodeCache::new(record.revision, policy));
+        cache.synchronize(record.revision, policy);
+        let sources = match &record.kind {
+            NodeKind::Computation { inputs, .. } => inputs,
+            _ => unreachable!(),
+        };
+        let output = cache.lookup(inputs, |position, current, old| {
+            self.stats.memo_comparisons += 1;
+            Ok::<_, EvalError>(
+                graph
+                    .node_record(sources[position].source)?
+                    .semantics
+                    .equivalent(current, old),
+            )
+        })?;
+        if output.is_some() {
+            self.stats.memo_hits += 1;
+        } else {
+            self.stats.memo_misses += 1;
+        }
+        Ok(output)
+    }
+    pub(crate) fn memo_insert(
+        &mut self,
+        node: NodeId,
+        record: &NodeRecord,
+        inputs: &[SharedValue],
+        output: SharedValue,
+    ) {
+        let policy = self
+            .cache
+            .config
+            .get(&node)
+            .copied()
+            .unwrap_or_default()
+            .memo;
+        if policy.capacity() != 0 {
             let cache = self
-                .context_caches
-                .get_mut(node)
-                .expect("Synchronized context cache");
+                .cache
+                .memo
+                .entry(node)
+                .or_insert_with(|| NodeCache::new(record.revision, policy));
+            cache.synchronize(record.revision, policy);
+            cache.insert(inputs, output);
+        }
+    }
+    pub(crate) fn context_lookup(
+        &mut self,
+        snapshot: &EvaluationSnapshot,
+        frame: &SharedValue,
+        node: NodeId,
+    ) -> Result<Option<SharedValue>, EvalError> {
+        let capacity = self
+            .cache
+            .config
+            .get(&node)
+            .copied()
+            .unwrap_or_default()
+            .context
+            .capacity();
+        if capacity == 0 {
+            return Ok(None);
+        }
+        if !self.cache.context.contains_key(&node) {
+            self.cache.context.insert(
+                node,
+                NodeContextCache::new(&snapshot.graph, node, capacity)?,
+            );
+            self.stats.projection_builds += 1;
+        }
+        let cache = self.cache.context.get_mut(&node).unwrap();
+        if cache
+            .roots
+            .iter()
+            .any(|&id| root_value(snapshot, frame, id).is_none())
+        {
+            return Ok(None);
+        }
+        let output = cache.lookup(|id, old| {
+            self.stats.context_comparisons += 1;
+            Ok::<_, EvalError>(
+                snapshot
+                    .graph
+                    .node_record(id)?
+                    .semantics
+                    .equivalent(root_value(snapshot, frame, id).unwrap(), old),
+            )
+        })?;
+        if output.is_some() {
+            self.stats.context_hits += 1;
+        } else {
+            self.stats.context_misses += 1;
+        }
+        Ok(output)
+    }
+    pub(crate) fn context_insert(
+        &mut self,
+        snapshot: &EvaluationSnapshot,
+        frame: &SharedValue,
+        node: NodeId,
+        output: SharedValue,
+    ) {
+        if let Some(cache) = self.cache.context.get_mut(&node) {
             let roots = cache
                 .roots
                 .iter()
-                .map(|&root| {
-                    Arc::clone(
-                        context
-                            .value(root)
-                            .expect("Successfully resolved root input"),
-                    )
+                .map(|&id| {
+                    root_value(snapshot, frame, id)
+                        .expect("Resolved root")
+                        .clone()
                 })
                 .collect();
-            cache.insert(roots, Arc::clone(&value));
+            cache.insert(roots, output);
         }
-        values.insert(node, Arc::clone(&value));
-        Ok(value)
+    }
+}
+fn root_value<'a>(
+    snapshot: &'a EvaluationSnapshot,
+    frame: &'a SharedValue,
+    node: NodeId,
+) -> Option<&'a SharedValue> {
+    if node == snapshot.graph.frame().id {
+        Some(frame)
+    } else {
+        snapshot.inputs.get(&node)
     }
 }
 
-#[cfg(test)]
-mod tests;
+/// One snapshot, multiple frame requests, exclusive use of one persistent evaluator.
+pub struct EvaluationScope<'a> {
+    pub(crate) snapshot: EvaluationSnapshot,
+    pub(crate) evaluator: &'a mut Evaluator,
+}
+impl EvaluationScope<'_> {
+    pub fn snapshot(&self) -> &EvaluationSnapshot {
+        &self.snapshot
+    }
+    pub fn evaluate(&mut self, batch: RequestBatch) -> Result<EvaluationResults, EvalError> {
+        self.evaluator.evaluate(&self.snapshot, batch)
+    }
+    /// Owns its Arc so the value outlives this temporary scope and scratch.
+    pub fn sample<T: Send + Sync + 'static>(
+        &mut self,
+        frame: FrameIndex,
+        node: Node<T>,
+    ) -> Result<Arc<T>, EvalError> {
+        let mut batch = RequestBatch::new();
+        let id = batch.at(frame).request(node);
+        self.evaluate(batch)?.get_shared(id)
+    }
+}

@@ -259,9 +259,17 @@ impl GraphState {
                 }
             }
             let id = SnapshotId::new();
-            self.graph = edit.graph;
-            self.inputs = edit.inputs;
-            self.snapshot_id = id;
+            // Publish the entire basis before any old user-owned value is dropped.
+            // A panicking destructor cannot leave graph and inputs from different commits.
+            let old = std::mem::replace(
+                self,
+                Self {
+                    graph: edit.graph,
+                    inputs: edit.inputs,
+                    snapshot_id: id,
+                },
+            );
+            drop(old);
         } else {
             // Defaults affect future nodes only and do not alter the calculation basis.
             self.graph = edit.graph;

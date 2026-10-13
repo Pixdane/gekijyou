@@ -7,11 +7,17 @@
 //! substitution in every downstream computation. Approximate float equality usually
 //! violates this requirement; bitwise comparison is available through custom semantics.
 
+mod cache;
+mod context_cache;
 mod error;
+mod eval;
 mod graph;
 mod inputs;
 mod node;
+mod request;
 mod snapshot;
+#[cfg(test)]
+mod test_allocations;
 mod value;
 
 pub use error::{EvalError, GraphError};
@@ -26,3 +32,6 @@ pub use snapshot::{EvaluationSnapshot, SnapshotId};
 /// New applications use the snapshot-based API at the crate root.
 #[cfg(feature = "p35-baseline")]
 pub mod p35;
+
+pub use eval::{CacheStats, EvalStats, EvaluationScope, Evaluator};
+pub use request::{EvaluationResults, FrameRequests, RequestBatch, RequestId};

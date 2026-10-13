@@ -22,6 +22,10 @@ impl NodeCache {
         }
     }
 
+    pub(super) fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
     /// Lazily discard only this node's entries after definition or policy edits.
     pub(super) fn synchronize(&mut self, revision: u64, policy: CachePolicy) {
         if self.revision != revision || self.policy != policy {
@@ -108,7 +112,7 @@ mod tests {
 
     #[test]
     fn policies_bound_entries_and_hits_promote_lru() {
-        for policy in [CachePolicy::Transient, CachePolicy::Lru { capacity: 0 }] {
+        for policy in [CachePolicy::Off, CachePolicy::Lru { capacity: 0 }] {
             let mut cache = NodeCache::new(0, policy);
             cache.insert(&[value(1)], value(10));
             assert!(cache.entries.is_empty());
@@ -161,7 +165,7 @@ mod tests {
         cache.synchronize(8, CachePolicy::Lru { capacity: 4 });
         assert!(cache.entries.is_empty());
         cache.insert(&[], value(30));
-        cache.synchronize(8, CachePolicy::Transient);
+        cache.synchronize(8, CachePolicy::Off);
         assert!(cache.entries.is_empty());
     }
 
@@ -202,68 +206,7 @@ mod tests {
     }
     // Test-only allocation accounting is thread-local: parallel unit tests cannot
     // contribute to this scope, and release/library builds do not contain it.
-    mod allocations {
-        use std::{
-            alloc::{GlobalAlloc, Layout, System},
-            cell::Cell,
-        };
-        std::thread_local! {
-            static COUNT: Cell<Option<usize>> = const { Cell::new(None) };
-        }
-        struct Meter;
-        fn record() {
-            let _ = COUNT.try_with(|count| {
-                if let Some(n) = count.get() {
-                    count.set(Some(n + 1));
-                }
-            });
-        }
-        unsafe impl GlobalAlloc for Meter {
-            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-                let p = unsafe { System.alloc(layout) };
-                if !p.is_null() {
-                    record();
-                }
-                p
-            }
-            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-                let p = unsafe { System.alloc_zeroed(layout) };
-                if !p.is_null() {
-                    record();
-                }
-                p
-            }
-            unsafe fn realloc(&self, p: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-                let next = unsafe { System.realloc(p, layout, size) };
-                if !next.is_null() {
-                    record();
-                }
-                next
-            }
-            unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
-                unsafe { System.dealloc(p, layout) }
-            }
-        }
-        #[global_allocator]
-        static ALLOCATOR: Meter = Meter;
-        struct Guard;
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                COUNT.with(|count| count.set(None));
-            }
-        }
-        pub fn count(f: impl FnOnce()) -> usize {
-            COUNT.with(|count| {
-                assert!(count.get().is_none());
-                count.set(Some(0));
-            });
-            let guard = Guard;
-            f();
-            let n = COUNT.with(|count| count.get().unwrap());
-            drop(guard);
-            n
-        }
-    }
+    use crate::test_allocations as allocations;
 
     #[test]
     fn full_last_reuses_input_allocation_through_continuous_misses() {

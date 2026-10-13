@@ -38,11 +38,11 @@ fn errors_and_panics_burn_handles_without_publishing_partial_edits() {
     });
     assert!(error.is_err());
     assert_eq!(state.snapshot().id(), original);
-    let mut panicked = None;
+    let panicked = std::cell::Cell::new(None);
     assert!(
         catch_unwind(AssertUnwindSafe(|| {
             let _ = state.edit::<()>(|e| {
-                panicked = Some(e.input::<u32>());
+                panicked.set(Some(e.input::<u32>()));
                 panic!("rollback")
             });
         }))
@@ -50,8 +50,8 @@ fn errors_and_panics_burn_handles_without_publishing_partial_edits() {
     );
     let valid = state.edit(|e| Ok(e.input::<u32>())).unwrap();
     assert_ne!(valid.node(), leaked.unwrap().node());
-    assert_ne!(valid.node(), panicked.unwrap().node());
-    for invalid in [leaked.unwrap(), panicked.unwrap()] {
+    assert_ne!(valid.node(), panicked.get().unwrap().node());
+    for invalid in [leaked.unwrap(), panicked.get().unwrap()] {
         assert!(state.edit(|e| e.set(invalid, 12)).is_err());
     }
 }

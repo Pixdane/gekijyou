@@ -1,8 +1,5 @@
 use super::{Graph, GraphError, NodeId, node::NodeKind, value::SharedValue};
-use std::{
-    collections::{HashSet, VecDeque},
-    sync::Arc,
-};
+use std::collections::{HashSet, VecDeque};
 struct Entry {
     roots: Box<[SharedValue]>,
     output: SharedValue,

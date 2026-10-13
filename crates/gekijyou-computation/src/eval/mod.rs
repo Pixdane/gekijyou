@@ -337,11 +337,8 @@ impl Evaluator {
         if capacity == 0 {
             return Ok(None);
         }
-        if !self.cache.context.contains_key(&node) {
-            self.cache.context.insert(
-                node,
-                NodeContextCache::new(&snapshot.graph, node, capacity)?,
-            );
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.cache.context.entry(node) {
+            entry.insert(NodeContextCache::new(&snapshot.graph, node, capacity)?);
             self.stats.projection_builds += 1;
         }
         let cache = self.cache.context.get_mut(&node).unwrap();

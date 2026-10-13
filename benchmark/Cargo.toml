@@ -29,3 +29,7 @@ path = "src/bin/snapshot_cost.rs"
 [[bin]]
 name = "bevy_scene"
 path = "src/bin/bevy_scene.rs"
+
+[[bin]]
+name = "async_execution"
+path = "src/bin/async_execution.rs"

@@ -6,7 +6,9 @@
 //! Run them sequentially on the same machine and toolchain; allocation accounting
 //! includes worker threads but excludes allocator metadata and does not measure RSS.
 //! The `snapshot_cost` and `bevy_scene` executables separately measure snapshot/edit
-//! costs and ECS input extraction, frame preparation and output application.
+//! costs and explicit ECS input extraction/commit, snapshot access, request construction,
+//! evaluation and output application. `async_execution` measures nonblocking
+//! dispatch/completion/cache coordination and cancellation across request sessions.
 //!
 //! Persistent caches are disabled for backend comparisons. Independent entity DFS
 //! creates one evaluator per actor and repeats shared phase work; it uses TaskPool

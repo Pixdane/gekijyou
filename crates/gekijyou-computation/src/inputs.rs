@@ -8,37 +8,8 @@ use std::{
     sync::Arc,
 };
 
-/// Input handles that can be combined with `F` to produce output `O`.
-///
-/// Built-in implementations support `()`, a single [`Node<T>`], and tuples of one
-/// to four nodes. Custom input wrappers can delegate to these implementations.
-/// [`Graph::map`](super::Graph::map) and [`Graph::replace`](super::Graph::replace)
-/// share the same construction step.
-///
-/// Custom adapters wrap the built-in input shapes by delegating definition
-/// construction. The erased representation stays private so adapters preserve
-/// the declared input and output types:
-///
-/// ```
-/// use gekijyou_computation::{ComputationDefinition, ComputationInputs, Graph, Node};
-///
-/// struct Position(Node<i64>, Node<i64>);
-///
-/// impl<F, O> ComputationInputs<F, O> for Position
-/// where
-///     F: Fn(&i64, &i64) -> O + Send + Sync + 'static,
-///     O: Send + Sync + 'static,
-/// {
-///     fn build_computation(&self, f: F) -> ComputationDefinition<O> {
-///         (self.0, self.1).build_computation(f)
-///     }
-/// }
-///
-/// let mut graph = Graph::new();
-/// let x = graph.constant(10_i64);
-/// let y = graph.constant(20_i64);
-/// let point = graph.map(Position(x, y), |x: &i64, y: &i64| (*x, *y));
-/// ```
+/// Ordered typed dependencies: (), Node<T>, or tuples of one to four Nodes.
+/// Custom adapters delegate to these shapes, preserving the erased output type.
 pub trait ComputationInputs<F, O> {
     /// Builds a definition without executing the closure or modifying a graph.
     /// Handle ownership and dependencies are checked when the graph inserts or
@@ -57,7 +28,7 @@ pub trait ComputationInputs<F, O> {
 /// through function-pointer subtyping.
 ///
 /// ```compile_fail
-/// use gekijyou_computation::{ComputationDefinition, ComputationInputs, Graph};
+/// use gekijyou_computation::{ComputationDefinition, ComputationInputs};
 ///
 /// type Callback = fn(&str);
 /// type StaticCallback = fn(&'static str);
@@ -72,10 +43,6 @@ pub trait ComputationInputs<F, O> {
 ///     }
 /// }
 ///
-/// let mut graph = Graph::new();
-/// let node = graph.map(RelabeledInputs, ());
-/// graph.replace(node, RelabeledInputs, ()).unwrap();
-/// graph.validate().unwrap();
 /// ```
 pub struct ComputationDefinition<O> {
     inputs: Box<[Dependency]>,

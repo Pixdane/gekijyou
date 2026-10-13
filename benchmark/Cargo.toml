@@ -16,3 +16,7 @@ path = "src/bin/timing.rs"
 [[bin]]
 name = "allocations"
 path = "src/bin/allocations/main.rs"
+
+[[bin]]
+name = "snapshot_cost"
+path = "src/bin/snapshot_cost.rs"

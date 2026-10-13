@@ -1,134 +1,181 @@
 use super::value::{ErasedComputation, ValueSemantics};
-use slotmap::new_key_type;
 use std::{
     any::TypeId,
+    fmt,
+    hash::{Hash, Hasher},
     marker::PhantomData,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
-/// An integer target frame number.
-///
-/// Carries no frame rate or time domain. The caller defines conversions to seconds
-/// or local time.
+/// Integer target frame; time conversion belongs to the animation runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FrameIndex(pub u64);
 
-new_key_type! {
-    /// A node storage key local to one graph.
-    ///
-    /// Different graphs can produce equal keys. An internal graph identity and
-    /// this key together identify a node. Use typed [`Node<T>`] handles to build
-    /// computations through the public API.
-    pub struct NodeId;
+pub(crate) fn next_id(counter: &AtomicU64) -> u64 {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .expect("Identity space exhausted")
 }
 
-/// A lightweight handle to a node with output type `T` in one graph.
-///
-/// Copying or cloning a handle does not copy the output value and does not require
-/// `T` to implement [`Copy`] or [`Clone`]. Handles do not borrow the graph, so moving
-/// the graph preserves their validity. Adding a computation still requires the
-/// owning graph. A handle owns neither the graph nor its results and does not keep
-/// the graph alive.
-///
-/// The output type is invariant so a handle always names its exact stored type:
-///
-/// ```compile_fail
-/// use gekijyou_computation::{Graph, Node};
-///
-/// let mut graph = Graph::new();
-/// let node = graph.input::<fn(&str)>();
-/// let relabeled: Node<fn(&'static str)> = node;
-/// ```
-pub struct Node<T> {
-    pub(super) graph_id: GraphId,
-    pub(super) id: NodeId,
-    // Require the exact stored type without owning T or inheriting its Send/Sync bounds.
-    _marker: PhantomData<fn(T) -> T>,
-}
-
-impl<T> Node<T> {
-    // Private construction prevents callers from forging types or graph ownership.
-    pub(super) fn new(graph_id: GraphId, id: NodeId) -> Self {
-        Self {
-            graph_id,
-            id,
-            _marker: PhantomData,
-        }
+/// Process-local identity of one logical graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GraphId(u64);
+impl GraphId {
+    pub(crate) fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self(next_id(&NEXT))
     }
 }
 
-// Manual implementations avoid imposing Copy/Clone bounds on the marker type T.
-impl<T> Copy for Node<T> {}
+/// Non-reused identity within a graph, allocated even for failed transactions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NodeId(pub(crate) u64);
 
+/// Monotonic published graph definition version; ordinary inputs do not advance it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct GraphDefinitionEpoch(pub(crate) u64);
+impl GraphDefinitionEpoch {
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Copyable invariant typed handle. Copy does not require `T: Copy` or retain values.
+///
+/// ```compile_fail
+/// use gekijyou_computation::Node;
+/// fn relabel(x: Node<fn(&str)>) -> Node<fn(&'static str)> { x }
+/// ```
+pub struct Node<T> {
+    pub(crate) graph_id: GraphId,
+    pub(crate) id: NodeId,
+    marker: PhantomData<fn(T) -> T>,
+}
+impl<T> Node<T> {
+    pub(crate) fn new(graph_id: GraphId, id: NodeId) -> Self {
+        Self {
+            graph_id,
+            id,
+            marker: PhantomData,
+        }
+    }
+    pub fn id(self) -> NodeId {
+        self.id
+    }
+    pub fn graph_id(self) -> GraphId {
+        self.graph_id
+    }
+}
+impl<T> Copy for Node<T> {}
 impl<T> Clone for Node<T> {
     fn clone(&self) -> Self {
         *self
     }
 }
-
-/// Retention of node-local results keyed by ordered direct input values.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum CachePolicy {
-    /// Share results only within one context in a batch; retain no persistent entries.
-    Transient,
-    /// Retain the most recently used input combination and result.
-    #[default]
-    Last,
-    /// Retain at most `capacity` input combinations, evicting the least recently used.
-    /// Zero retains no persistent memo entries, like `Transient`.
-    Lru { capacity: usize },
+impl<T> PartialEq for Node<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.graph_id == other.graph_id && self.id == other.id
+    }
+}
+impl<T> Eq for Node<T> {}
+impl<T> Hash for Node<T> {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        self.graph_id.hash(h);
+        self.id.hash(h);
+    }
+}
+impl<T> fmt::Debug for Node<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Node")
+            .field("graph", &self.graph_id)
+            .field("id", &self.id)
+            .finish()
+    }
 }
 
+/// Writable ordinary external input. A computation Node cannot be converted into Input.
+///
+/// ```compile_fail
+/// use gekijyou_computation::Input;
+/// fn relabel(x: Input<fn(&str)>) -> Input<fn(&'static str)> { x }
+/// ```
+pub struct Input<T>(pub(crate) Node<T>);
+impl<T> Input<T> {
+    pub fn node(self) -> Node<T> {
+        self.0
+    }
+}
+impl<T> Copy for Input<T> {}
+impl<T> Clone for Input<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> fmt::Debug for Input<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// Persistent retention; Off still permits temporary sharing in a single evaluation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CachePolicy {
+    Off,
+    #[default]
+    Last,
+    /// Capacity must be nonzero at the public configuration boundary.
+    Lru {
+        capacity: usize,
+    },
+}
 impl CachePolicy {
-    pub(super) fn capacity(self) -> usize {
+    pub(crate) fn capacity(self) -> usize {
         match self {
-            Self::Transient => 0,
+            Self::Off => 0,
             Self::Last => 1,
             Self::Lru { capacity } => capacity,
         }
     }
 }
 
-/// A process-local graph identity independent of graph-local SlotMap keys.
+/// Independent evaluator-owned policies for direct memo and root-input caching.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct GraphId(u64);
-
-impl GraphId {
-    pub(super) fn new() -> Self {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-        // Only uniqueness is needed; this counter does not publish graph data.
-        // Prevent wraparound so old handles cannot match a later graph.
-        let id = NEXT_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .expect("Graph identity space exhausted");
-        Self(id)
+pub struct NodeCacheConfig {
+    pub memo: CachePolicy,
+    pub context: CachePolicy,
+}
+impl Default for NodeCacheConfig {
+    fn default() -> Self {
+        Self {
+            memo: CachePolicy::Last,
+            context: CachePolicy::Off,
+        }
     }
 }
 
-/// An input edge recording source ownership and the type expected by the closure.
-pub(super) struct Dependency {
-    pub(super) graph_id: GraphId,
-    pub(super) source: NodeId,
-    pub(super) type_id: TypeId,
+#[derive(Clone)]
+pub(crate) struct Dependency {
+    pub(crate) graph_id: GraphId,
+    pub(crate) source: NodeId,
+    pub(crate) type_id: TypeId,
 }
-
-/// Distinguishes externally supplied inputs from computations over dependencies.
-pub(super) enum NodeKind {
+#[derive(Clone)]
+pub(crate) enum NodeKind {
+    Frame,
     Input,
     Computation {
-        inputs: Box<[Dependency]>,
-        computation: Box<ErasedComputation>,
+        inputs: Arc<[Dependency]>,
+        computation: Arc<ErasedComputation>,
     },
 }
-
-/// A heterogeneous node record whose output type matches its Node<T> marker.
-pub(super) struct NodeRecord {
-    pub(super) type_id: TypeId,
-    /// Successful replacements of this node's computation definition.
-    pub(super) revision: u64,
-    pub(super) kind: NodeKind,
-    pub(super) semantics: ValueSemantics,
-    pub(super) cache_policy: CachePolicy,
-    /// Explicit opt-in retention of external-input projections; zero disables it.
-    pub(super) context_cache_capacity: usize,
+#[derive(Clone)]
+pub(crate) struct NodeRecord {
+    pub(crate) type_id: TypeId,
+    pub(crate) revision: u64,
+    pub(crate) kind: NodeKind,
+    pub(crate) semantics: ValueSemantics,
+    pub(crate) depends_on_frame: bool,
 }

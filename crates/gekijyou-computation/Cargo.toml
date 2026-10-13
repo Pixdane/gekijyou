@@ -11,3 +11,7 @@ thiserror.workspace = true
 
 [features]
 p35-baseline = []
+
+[[example]]
+name = "evaluate_scene"
+required-features = ["p35-baseline"]

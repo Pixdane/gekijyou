@@ -1,6 +1,6 @@
 //! Sample a simple animation at two frame indices.
 //! Run with `cargo run --example evaluate_scene`.
-use gekijyou_computation::{Context, EvalError, Evaluator, FrameIndex, Graph, RequestBatch};
+use gekijyou_computation::p35::{Context, EvalError, Evaluator, FrameIndex, Graph, RequestBatch};
 
 #[derive(Debug)]
 struct Scene {

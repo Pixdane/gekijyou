@@ -38,3 +38,8 @@ pub use request::{EvaluationResults, FrameRequests, RequestBatch, RequestId};
 
 pub use value::SharedValue;
 
+mod planner;
+pub use planner::{
+    ComputeCompletion, ComputeTask, ComputeTaskId, EvaluationPlan, Executor, PlannerConfig,
+    PlannerStats, SerialExecutor,
+};

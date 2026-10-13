@@ -51,6 +51,12 @@ pub enum EvalError {
     InvalidPlannerConfig,
     #[error("Planner active window exceeds task budget {limit}")]
     PlannerBudgetExceeded { limit: usize },
+    #[error("Plan is canceled")]
+    PlanCanceled,
+    #[error("Plan has not produced all requested outputs")]
+    PlanIncomplete,
+    #[error("Completion belongs to a different plan")]
+    ForeignPlanCompletion,
     #[error("Worker terminated with a panic")]
     WorkerPanicked,
 }

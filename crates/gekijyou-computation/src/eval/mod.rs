@@ -15,6 +15,8 @@ pub struct EvalStats {
     pub memo_hits: u64,
     pub memo_misses: u64,
     pub memo_comparisons: u64,
+    /// DFS invocations and accepted planned completions, including worker failure.
+    /// Canceled worker accounting is exposed by the executor lifecycle statistics.
     pub computation_calls: u64,
     pub context_hits: u64,
     pub context_misses: u64,
@@ -68,6 +70,9 @@ impl Evaluator {
             scratch: EvalScratch::default(),
             stats: EvalStats::default(),
         }
+    }
+    pub(crate) fn record_planned_call(&mut self) {
+        self.stats.computation_calls += 1;
     }
     pub fn stats(&self) -> EvalStats {
         self.stats

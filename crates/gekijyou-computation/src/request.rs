@@ -148,3 +148,42 @@ impl EvaluationResults {
             })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn typed_reads_validate_batch_index_and_concrete_storage_type() {
+        let batch = BatchId::new();
+        let outputs = vec![Arc::new(3_u64) as SharedValue];
+        let results = EvaluationResults {
+            batch,
+            snapshot: SnapshotId::new(),
+            outputs,
+        };
+        let invalid = RequestId::<u64> {
+            batch,
+            index: 2,
+            marker: PhantomData,
+        };
+        let wrong_type = RequestId::<u32> {
+            batch,
+            index: 0,
+            marker: PhantomData,
+        };
+        assert_eq!(
+            results.get(invalid),
+            Err(EvalError::InvalidRequest { index: 2 })
+        );
+        assert_eq!(
+            results.get_shared(wrong_type),
+            Err(EvalError::ResultTypeMismatch { index: 0 })
+        );
+        let foreign = RequestId::<u64> {
+            batch: BatchId::new(),
+            index: 0,
+            marker: PhantomData,
+        };
+        assert_eq!(results.get(foreign), Err(EvalError::ForeignRequest));
+    }
+}

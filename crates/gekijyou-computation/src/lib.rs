@@ -35,3 +35,6 @@ pub mod p35;
 
 pub use eval::{CacheStats, EvalStats, EvaluationScope, Evaluator};
 pub use request::{EvaluationResults, FrameRequests, RequestBatch, RequestId};
+
+pub use value::SharedValue;
+

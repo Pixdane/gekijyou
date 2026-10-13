@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/gekijyou-computation", "benchmark"]
+members = ["crates/gekijyou-computation", "crates/gekijyou-bevy", "benchmark"]
 default-members = ["crates/gekijyou-computation"]
 resolver = "3"
 
@@ -10,6 +10,7 @@ license = "GPL-3.0-only"
 
 [workspace.dependencies]
 gekijyou-computation = { path = "crates/gekijyou-computation" }
+gekijyou-bevy = { path = "crates/gekijyou-bevy" }
 slotmap = "1.1.1"
 smallvec = "1.16.3"
 thiserror = "2.0.21"

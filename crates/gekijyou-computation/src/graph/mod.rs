@@ -229,6 +229,14 @@ impl GraphState {
         &mut self,
         f: impl FnOnce(&mut GraphEdit) -> Result<R, GraphError>,
     ) -> Result<R, GraphError> {
+        self.try_edit(f)
+    }
+    /// Transaction adapter for integration errors. `E` preserves caller errors
+    /// while graph validation failures convert through `From<GraphError>`.
+    pub fn try_edit<R, E: From<GraphError>>(
+        &mut self,
+        f: impl FnOnce(&mut GraphEdit) -> Result<R, E>,
+    ) -> Result<R, E> {
         let mut edit = GraphEdit {
             graph: self.graph.clone(),
             inputs: self.inputs.clone(),
@@ -252,10 +260,10 @@ impl GraphState {
             for (&node, value) in edit.inputs.iter() {
                 let record = edit.graph.node_record(node)?;
                 if !matches!(record.kind, NodeKind::Input) {
-                    return Err(GraphError::NotInput { node });
+                    return Err(GraphError::NotInput { node }.into());
                 }
                 if record.type_id != value.as_ref().type_id() {
-                    return Err(GraphError::TypeMismatch { node });
+                    return Err(GraphError::TypeMismatch { node }.into());
                 }
             }
             let id = SnapshotId::new();

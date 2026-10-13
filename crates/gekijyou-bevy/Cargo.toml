@@ -1,0 +1,15 @@
+[package]
+name = "gekijyou-bevy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gekijyou-computation.workspace = true
+bevy_app = "0.20.0"
+bevy_ecs = "0.20.0"
+bevy_transform = "0.20.0"
+bevy_math = "0.20.0"
+bevy_color = "0.20.0"
+bevy_tasks = { version = "0.20.0", features = ["multi_threaded"] }
+thiserror.workspace = true

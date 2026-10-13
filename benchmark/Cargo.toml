@@ -20,3 +20,16 @@ path = "src/bin/allocations/main.rs"
 [[bin]]
 name = "snapshot_cost"
 path = "src/bin/snapshot_cost.rs"
+
+[[bin]]
+name = "bevy_scene"
+path = "src/bin/bevy_scene.rs"
+
+[dependencies.gekijyou-bevy]
+workspace = true
+[dependencies.bevy_ecs]
+version = "0.20.0"
+[dependencies.bevy_math]
+version = "0.20.0"
+[dependencies.bevy_transform]
+version = "0.20.0"

@@ -1,2 +1,4 @@
 [toolchain]
-channel = "nightly"
+# Bevy 0.20 requires stabilized Rust 1.95 APIs; use the installed stable release.
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

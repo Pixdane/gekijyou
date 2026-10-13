@@ -1,7 +1,7 @@
 use std::{any::Any, sync::Arc};
 
 /// Erased output storage; NodeRecord::type_id records the concrete output type.
-pub(super) type SharedValue = Arc<dyn Any + Send + Sync + 'static>;
+pub type SharedValue = Arc<dyn Any + Send + Sync + 'static>;
 
 /// An erased computation whose arguments must match its input edges in order,
 /// count, and type.

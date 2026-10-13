@@ -53,11 +53,6 @@ pub use node::{
 };
 pub use snapshot::{EvaluationSnapshot, SnapshotId};
 
-/// Frozen P3.5 implementation for historical tests and benchmarks.
-/// New applications use the snapshot-based API at the crate root.
-#[cfg(feature = "p35-baseline")]
-pub mod p35;
-
 pub use eval::{CacheStats, EvalStats, EvaluationScope, Evaluator};
 pub use request::{EvaluationResults, FrameRequests, RequestBatch, RequestId};
 

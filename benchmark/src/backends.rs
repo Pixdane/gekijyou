@@ -3,12 +3,12 @@
 //! evaluator initialization, result reads and output retention; entity DFS counts
 //! all independent evaluators and loss of shared dependencies. Persistent caches
 //! are Off. Timing and allocation executables use the same workload/observer API.
-use crate::runner::Observer;
+use crate::measurement::Observer;
 use bevy_tasks::TaskPool;
 use gekijyou_bevy::BevyExecutor;
 use gekijyou_computation::{
     CachePolicy, EvalStats, Evaluator, FrameIndex, GraphState, Node, NodeCacheConfig,
-    PlannerConfig, PlannerStats, RequestBatch, SerialExecutor, p35,
+    PlannerConfig, PlannerStats, RequestBatch, SerialExecutor,
 };
 use std::{
     hint::black_box,
@@ -17,15 +17,13 @@ use std::{
 
 #[derive(Clone, Copy, Debug)]
 pub enum Backend {
-    P35,
     Dfs,
     PlannerSerial,
     PlannerParallel(usize),
     EntityParallelDfs,
 }
 impl Backend {
-    pub const ALL: [Self; 6] = [
-        Self::P35,
+    pub const ALL: [Self; 5] = [
         Self::Dfs,
         Self::PlannerSerial,
         Self::PlannerParallel(1),
@@ -34,7 +32,6 @@ impl Backend {
     ];
     fn label(self) -> String {
         match self {
-            Self::P35 => "p35_dfs".into(),
             Self::Dfs => "dfs".into(),
             Self::PlannerSerial => "planner_serial".into(),
             Self::PlannerParallel(n) => format!("planner_parallel_{n}"),
@@ -50,22 +47,20 @@ fn compute(phase: u64, actor: u64, rounds: u64) -> u64 {
     }
     v
 }
-pub struct ReworkScene {
+pub struct BackendScene {
     state: GraphState,
     phase: Node<u64>,
     nodes: Vec<Node<u64>>,
-    legacy: p35::Graph,
-    legacy_nodes: Vec<p35::Node<u64>>,
     frames: usize,
     oracle: Vec<u64>,
 }
-pub struct ReworkResult {
+pub struct BackendResult {
     pub values: Vec<u64>,
     pub calls: u64,
     pub initialized_evaluators: usize,
     pub planner: PlannerStats,
 }
-impl ReworkScene {
+impl BackendScene {
     pub fn new(actors: usize, frames: usize, rounds: u64, periodic: bool) -> Self {
         let mut state = GraphState::new();
         let (phase, nodes) = state
@@ -81,23 +76,6 @@ impl ReworkScene {
                 Ok((phase, nodes))
             })
             .unwrap();
-        let mut legacy = p35::Graph::new();
-        legacy.set_default_eq::<u64>();
-        let legacy_phase = legacy.map(
-            legacy.frame(),
-            move |f: &p35::FrameIndex| if periodic { f.0 % 8 } else { f.0 },
-        );
-        let legacy_nodes = (0..actors)
-            .map(|a| legacy.map(legacy_phase, move |p: &u64| compute(*p, a as u64, rounds)))
-            .collect::<Vec<_>>();
-        legacy
-            .set_cache_policy(legacy_phase, p35::CachePolicy::Transient)
-            .unwrap();
-        for &n in &legacy_nodes {
-            legacy
-                .set_cache_policy(n, p35::CachePolicy::Transient)
-                .unwrap();
-        }
         // Separate oracle implementation, not graph traversal or the worker kernel.
         let mut oracle = Vec::new();
         for f in 0..frames {
@@ -113,8 +91,6 @@ impl ReworkScene {
             state,
             phase,
             nodes,
-            legacy,
-            legacy_nodes,
             frames,
             oracle,
         }
@@ -131,33 +107,10 @@ impl ReworkScene {
         }
         eval
     }
-    pub fn verify(&self, result: &ReworkResult) {
+    pub fn verify(&self, result: &BackendResult) {
         assert_eq!(result.values, self.oracle);
     }
-    pub fn run(&self, backend: Backend, pool: &TaskPool) -> ReworkResult {
-        if matches!(backend, Backend::P35) {
-            let mut evaluator = p35::Evaluator::new(&self.legacy);
-            let mut batch = p35::RequestBatch::new(&self.legacy);
-            let mut ids = Vec::new();
-            for f in 0..self.frames {
-                let mut context = p35::Context::new(&self.legacy);
-                context
-                    .set(&self.legacy, self.legacy.frame(), p35::FrameIndex(f as u64))
-                    .unwrap();
-                let context = batch.add_context(context).unwrap();
-                for &n in &self.legacy_nodes {
-                    ids.push(batch.request(context, n).unwrap());
-                }
-            }
-            let results = evaluator.evaluate_batch(&self.legacy, batch).unwrap();
-            let values = ids.iter().map(|&id| *results.get(id).unwrap()).collect();
-            return ReworkResult {
-                values,
-                calls: evaluator.stats().computation_calls,
-                initialized_evaluators: 1,
-                planner: PlannerStats::default(),
-            };
-        }
+    pub fn run(&self, backend: Backend, pool: &TaskPool) -> BackendResult {
         if matches!(backend, Backend::EntityParallelDfs) {
             // Each entity owns an evaluator over the same immutable global graph.
             // Creation/configuration and duplicated phase work are inside the scope.
@@ -195,7 +148,7 @@ impl ReworkScene {
                     reordered[f * self.nodes.len() + actor] = v;
                 }
             }
-            return ReworkResult {
+            return BackendResult {
                 values: reordered,
                 calls,
                 initialized_evaluators: self.nodes.len(),
@@ -235,7 +188,7 @@ impl ReworkScene {
                 .unwrap(),
             _ => unreachable!(),
         };
-        ReworkResult {
+        BackendResult {
             values: ids.iter().map(|&id| *results.get(id).unwrap()).collect(),
             calls: eval.stats().computation_calls,
             initialized_evaluators: 1,
@@ -256,7 +209,7 @@ pub fn measure(
     )?;
     for rounds in [0, 20000] {
         for periodic in [false, true] {
-            let scene = ReworkScene::new(32, 64, rounds, periodic);
+            let scene = BackendScene::new(32, 64, rounds, periodic);
             for backend in Backend::ALL {
                 scene.verify(&scene.run(backend, &pool));
             }

@@ -16,7 +16,7 @@ pub struct FrameIndex(pub u64);
 
 pub(crate) fn next_id(counter: &AtomicU64) -> u64 {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
         .expect("Identity space exhausted")
 }
 

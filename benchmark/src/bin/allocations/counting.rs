@@ -1,5 +1,5 @@
 //! Requested-layout accounting, scoped to this allocation-only binary.
-use benchmark::runner::{Allocations, Observation, Observer};
+use benchmark::measurement::{Allocations, Observation, Observer};
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},

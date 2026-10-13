@@ -7,7 +7,12 @@ publish = false
 autobins = false
 
 [dependencies]
-gekijyou-computation = { workspace = true, features = ["p35-baseline"] }
+gekijyou-computation.workspace = true
+gekijyou-bevy.workspace = true
+bevy_ecs.workspace = true
+bevy_math.workspace = true
+bevy_transform.workspace = true
+bevy_tasks.workspace = true
 
 [[bin]]
 name = "timing"
@@ -24,24 +29,3 @@ path = "src/bin/snapshot_cost.rs"
 [[bin]]
 name = "bevy_scene"
 path = "src/bin/bevy_scene.rs"
-
-[dependencies.gekijyou-bevy]
-workspace = true
-[dependencies.bevy_ecs]
-version = "0.20.0"
-[dependencies.bevy_math]
-version = "0.20.0"
-[dependencies.bevy_transform]
-version = "0.20.0"
-
-[dependencies.bevy_tasks]
-version = "0.20.0"
-features = ["multi_threaded"]
-
-[[bin]]
-name = "rework_timing"
-path = "src/bin/rework_timing.rs"
-
-[[bin]]
-name = "rework_allocations"
-path = "src/bin/rework_allocations.rs"

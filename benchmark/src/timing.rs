@@ -1,5 +1,5 @@
 //! Wall-clock observer with no allocation instrumentation.
-use crate::runner::{Observation, Observer};
+use crate::measurement::{Observation, Observer};
 use std::{hint::black_box, time::Instant};
 #[derive(Default)]
 pub struct Timer;

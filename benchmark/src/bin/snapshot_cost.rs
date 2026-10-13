@@ -1,4 +1,4 @@
-//! R1 edit and stable-snapshot costs measured separately. Large payloads and closures
+//! Edit and stable-snapshot costs measured separately. Large payloads and closures
 //! are shared; input-only edits must not clone graph metadata. Run with --release.
 use gekijyou_computation::{FrameIndex, GraphState};
 use std::{hint::black_box, sync::Arc, time::Instant};

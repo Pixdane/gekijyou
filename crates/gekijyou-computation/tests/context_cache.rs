@@ -1,4 +1,5 @@
-use gekijyou_computation::{
+#![cfg(feature = "p35-baseline")]
+use gekijyou_computation::p35::{
     BatchResults, CachePolicy, Context, EvalError, EvalStats, Evaluator, FrameIndex, Graph, Node,
     RequestBatch, RequestId,
 };

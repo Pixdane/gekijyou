@@ -175,3 +175,14 @@ pub use eval::{EvalStats, Evaluator};
 pub use graph::Graph;
 pub use inputs::{ComputationDefinition, ComputationInputs};
 pub use node::{CachePolicy, FrameIndex, Node, NodeId};
+
+/// Baseline API alias while the frozen implementation is extracted. The R1
+/// migration replaces this alias with the preserved source module.
+#[cfg(feature = "p35-baseline")]
+pub mod p35 {
+    pub use super::{
+        BatchResults, CachePolicy, ComputationDefinition, ComputationInputs,
+        Context, ContextId, EvalError, EvalStats, Evaluator, FrameIndex,
+        Graph, GraphError, Node, NodeId, RequestBatch, RequestId,
+    };
+}

@@ -1,7 +1,8 @@
+#![cfg(feature = "p35-baseline")]
 mod fixture;
 
 use fixture::{ActorStyle, DialogueGraph, Expression, Scene, expected_scene};
-use gekijyou_computation::{FrameIndex, GraphError};
+use gekijyou_computation::p35::{FrameIndex, GraphError};
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{

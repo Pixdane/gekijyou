@@ -7,7 +7,7 @@ publish = false
 autobins = false
 
 [dependencies]
-gekijyou-computation.workspace = true
+gekijyou-computation = { workspace = true, features = ["p35-baseline"] }
 
 [[bin]]
 name = "timing"

@@ -1,6 +1,6 @@
 //! Workload definitions shared by correctness, timing and allocation runs.
 use crate::scene::{Config, Input, ValueComparison, Viewport, Workload, direct_checksum, inputs};
-use gekijyou_computation::{CachePolicy, Evaluator, FrameIndex};
+use gekijyou_computation::p35::{CachePolicy, Evaluator, FrameIndex};
 use std::hint::black_box;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

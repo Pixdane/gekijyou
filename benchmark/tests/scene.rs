@@ -49,7 +49,7 @@ fn memo_scene_loads_preserve_complete_direct_results_and_expected_reuse() {
             }
             evaluate(&workload, &mut evaluator, &data[0]);
             let stats = evaluator.stats();
-            if configuration.policy == gekijyou_computation::CachePolicy::Transient {
+            if configuration.policy == gekijyou_computation::p35::CachePolicy::Transient {
                 assert_eq!(stats.memo_hits + stats.memo_misses, 0);
                 assert!(stats.computation_calls > 1);
             } else {
@@ -67,7 +67,7 @@ fn memo_scene_loads_preserve_complete_direct_results_and_expected_reuse() {
                                 < 0.02
                         )
                     }
-                    Case::History if matches!(configuration.policy, gekijyou_computation::CachePolicy::Lru { capacity } if capacity>=4) =>
+                    Case::History if matches!(configuration.policy, gekijyou_computation::p35::CachePolicy::Lru { capacity } if capacity>=4) =>
                     {
                         assert_eq!(stats.computation_calls, 0);
                         assert_eq!(

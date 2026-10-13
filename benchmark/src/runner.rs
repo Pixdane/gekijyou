@@ -4,7 +4,7 @@ use crate::{
     scenario::{Case, Configuration, Mode, Suite, evaluate, workload},
     scene::{Config, Input, Workload, direct_checksum},
 };
-use gekijyou_computation::EvalStats;
+use gekijyou_computation::p35::EvalStats;
 use std::{
     hint::black_box,
     io::{self, Write},

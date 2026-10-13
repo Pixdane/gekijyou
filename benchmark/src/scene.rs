@@ -1,6 +1,6 @@
 //! Shared fixture for correctness tests and the release performance example.
 //! This is an integer scene-state workload, not rendering or GPU work.
-use gekijyou_computation::{
+use gekijyou_computation::p35::{
     BatchResults, CachePolicy, ComputationInputs, Context, Evaluator, FrameIndex, Graph, Node,
     RequestBatch, RequestId,
 };

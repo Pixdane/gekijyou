@@ -8,3 +8,6 @@ license.workspace = true
 slotmap.workspace = true
 smallvec.workspace = true
 thiserror.workspace = true
+
+[features]
+p35-baseline = []

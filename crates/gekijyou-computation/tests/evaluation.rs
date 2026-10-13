@@ -1,4 +1,5 @@
-use gekijyou_computation::{
+#![cfg(feature = "p35-baseline")]
+use gekijyou_computation::p35::{
     CachePolicy, Context, EvalError, Evaluator, FrameIndex, Graph, GraphError, RequestBatch,
 };
 use std::{

@@ -9,9 +9,10 @@ use std::{
     marker::PhantomData,
     sync::{Arc, atomic::AtomicU64},
 };
+/// Opaque identity shared by one request batch and its completed results.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BatchId(u64);
-impl BatchId {
+pub struct RequestBatchId(u64);
+impl RequestBatchId {
     fn new() -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         Self(next_id(&NEXT))
@@ -25,7 +26,7 @@ impl BatchId {
 /// fn relabel(x: RequestId<fn(&str)>) -> RequestId<fn(&'static str)> { x }
 /// ```
 pub struct RequestId<T> {
-    batch: BatchId,
+    batch: RequestBatchId,
     index: usize,
     marker: PhantomData<fn(T) -> T>,
 }
@@ -52,15 +53,18 @@ pub(crate) struct Request {
 
 /// Ordered Frame/Node requests; one bound scope supplies all ordinary inputs.
 pub struct RequestBatch {
-    id: BatchId,
+    id: RequestBatchId,
     pub(crate) requests: Vec<Request>,
 }
 impl RequestBatch {
     pub fn new() -> Self {
         Self {
-            id: BatchId::new(),
+            id: RequestBatchId::new(),
             requests: Vec::new(),
         }
+    }
+    pub fn id(&self) -> RequestBatchId {
+        self.id
     }
     pub fn at(&mut self, frame: FrameIndex) -> FrameRequests<'_> {
         FrameRequests { batch: self, frame }
@@ -111,11 +115,14 @@ impl FrameRequests<'_> {
 }
 /// Owns only requested outputs, independently of evaluator, graph and inputs.
 pub struct EvaluationResults {
-    batch: BatchId,
+    batch: RequestBatchId,
     snapshot: SnapshotId,
     outputs: Vec<SharedValue>,
 }
 impl EvaluationResults {
+    pub fn batch_id(&self) -> RequestBatchId {
+        self.batch
+    }
     pub fn snapshot_id(&self) -> SnapshotId {
         self.snapshot
     }
@@ -154,7 +161,7 @@ mod tests {
     use super::*;
     #[test]
     fn typed_reads_validate_batch_index_and_concrete_storage_type() {
-        let batch = BatchId::new();
+        let batch = RequestBatchId::new();
         let outputs = vec![Arc::new(3_u64) as SharedValue];
         let results = EvaluationResults {
             batch,
@@ -180,7 +187,7 @@ mod tests {
             Err(EvalError::ResultTypeMismatch { index: 0 })
         );
         let foreign = RequestId::<u64> {
-            batch: BatchId::new(),
+            batch: RequestBatchId::new(),
             index: 0,
             marker: PhantomData,
         };

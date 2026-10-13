@@ -1,19 +1,21 @@
 //! Actual ECS scenario: report input extraction, evaluation and application
 //! separately. Each iteration verifies every entity against an independent oracle.
+//! sync_ns includes the atomic GraphState input commit; snapshot_ns measures only
+//! access to the resulting immutable snapshot. No automatic schedule is installed.
 use bevy_ecs::prelude::*;
 use bevy_math::Vec3;
 use bevy_transform::components::Transform;
-use gekijyou_bevy::{AnimationRuntime, Bindings, InputField, OutputField};
-use gekijyou_computation::FrameIndex;
+use gekijyou_bevy::{Bindings, InputField, OutputField};
+use gekijyou_computation::{Evaluator, FrameIndex, GraphState};
 use std::time::Instant;
 #[derive(Component)]
 struct Offset(u64);
 fn main() {
     let mut world = World::new();
     let source = world.spawn(Offset(10)).id();
-    let mut runtime = AnimationRuntime::new(2);
+    let mut state = GraphState::new();
     let mut bindings = Bindings::new();
-    let (input, nodes) = runtime
+    let (input, nodes) = state
         .edit(|e| {
             let i = e.input::<u64>();
             let mut nodes = Vec::new();
@@ -29,7 +31,7 @@ fn main() {
         .unwrap();
     bindings
         .bind_input(
-            runtime.snapshot(),
+            &state.snapshot(),
             source,
             input,
             InputField::new(|c: &Offset| c.0),
@@ -41,29 +43,43 @@ fn main() {
         entities.push(entity);
         bindings
             .bind_output(
-                runtime.snapshot(),
+                &state.snapshot(),
                 entity,
                 node,
                 OutputField::transform_translation(),
             )
             .unwrap();
     }
-    println!("sample\tentities\tsync_ns\tevaluate_ns\tapply_ns");
+    let mut evaluator = Evaluator::new(&state);
+    println!("sample\tentities\tsync_ns\tsnapshot_ns\trequest_ns\tevaluate_ns\tapply_ns");
     for sample in 0..9 {
         let mut sync = 0;
+        let mut snapshot_time = 0;
+        let mut request_time = 0;
         let mut evaluate = 0;
         let mut apply = 0;
         for f in 0..128 {
-            runtime.pause();
             let start = Instant::now();
-            runtime.sync_inputs(&world, &bindings).unwrap();
+            bindings.sync_inputs(&world, &mut state).unwrap();
             sync += start.elapsed().as_nanos();
-            runtime.play();
             let start = Instant::now();
-            runtime.prepare(&bindings, &[FrameIndex(f)]).unwrap();
+            let snapshot = state.snapshot();
+            snapshot_time += start.elapsed().as_nanos();
+            let start = Instant::now();
+            let mut bound = bindings.request(&snapshot, &[FrameIndex(f)]).unwrap();
+            let batch = bound.take_batch().unwrap();
+            request_time += start.elapsed().as_nanos();
+            let start = Instant::now();
+            let results = evaluator
+                .bind(snapshot.clone())
+                .unwrap()
+                .evaluate(batch)
+                .unwrap();
             evaluate += start.elapsed().as_nanos();
             let start = Instant::now();
-            bindings.apply(&mut world, &runtime, FrameIndex(f)).unwrap();
+            bindings
+                .apply(&mut world, &snapshot, &bound, &results, FrameIndex(f))
+                .unwrap();
             apply += start.elapsed().as_nanos();
             for (actor, &entity) in entities.iter().enumerate() {
                 assert_eq!(
@@ -73,8 +89,10 @@ fn main() {
             }
         }
         println!(
-            "{sample}\t512\t{}\t{}\t{}",
+            "{sample}\t512\t{}\t{}\t{}\t{}\t{}",
             sync / 128,
+            snapshot_time / 128,
+            request_time / 128,
             evaluate / 128,
             apply / 128
         );

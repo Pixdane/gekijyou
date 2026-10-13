@@ -1,11 +1,31 @@
-use crate::RuntimeGeneration;
 use bevy_tasks::TaskPool;
 use gekijyou_computation::{EvalError, EvaluationSnapshot, SnapshotId};
 use std::{
     collections::{HashMap, VecDeque},
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
 };
+
+/// Process-local identity of an explicit request session, independent of snapshots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RequestGeneration(u64);
+impl RequestGeneration {
+    pub fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self(
+            NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .expect("Request generation exhausted"),
+        )
+    }
+}
+impl Default for RequestGeneration {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Total quotas across every generation, including canceled running workers.
 #[derive(Clone, Copy, Debug)]
@@ -33,7 +53,7 @@ pub struct TaskStats {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Session {
     snapshot: SnapshotId,
-    generation: RuntimeGeneration,
+    generation: RequestGeneration,
 }
 type Job<R> = Box<dyn FnOnce(EvaluationSnapshot) -> Result<R, EvalError> + Send>;
 struct Queued<R> {
@@ -74,11 +94,11 @@ impl<R> Drop for TerminalGuard<R> {
 pub struct FinishedTask<R> {
     pub id: TaskId,
     pub snapshot: SnapshotId,
-    pub generation: RuntimeGeneration,
+    pub generation: RequestGeneration,
     pub result: Result<R, EvalError>,
 }
 
-/// Bevy worker lifecycle prototype. Immutable jobs cannot access the coordinator
+/// Bevy worker lifecycle coordinator. Immutable jobs cannot access the coordinator
 /// or the main evaluator's caches. Switching sessions cancels queued jobs only;
 /// old running workers retain quota until one confirmed terminal message.
 ///
@@ -87,7 +107,7 @@ pub struct FinishedTask<R> {
 /// snapshots on natural completion. This is not a force-interruption mechanism.
 pub struct TaskCoordinator<R: Send + 'static> {
     snapshot: EvaluationSnapshot,
-    generation: RuntimeGeneration,
+    generation: RequestGeneration,
     limits: TaskLimits,
     next: u64,
     pending: VecDeque<Queued<R>>,
@@ -99,7 +119,7 @@ pub struct TaskCoordinator<R: Send + 'static> {
 impl<R: Send + 'static> TaskCoordinator<R> {
     pub fn new(
         snapshot: EvaluationSnapshot,
-        generation: RuntimeGeneration,
+        generation: RequestGeneration,
         limits: TaskLimits,
     ) -> Self {
         assert!(
@@ -190,8 +210,18 @@ impl<R: Send + 'static> TaskCoordinator<R> {
     pub fn set_session(
         &mut self,
         snapshot: EvaluationSnapshot,
-        generation: RuntimeGeneration,
+        generation: RequestGeneration,
     ) -> Result<(), EvalError> {
+        self.validate_snapshot(&snapshot)?;
+        if snapshot.id() == self.snapshot.id() && generation == self.generation {
+            return Ok(());
+        }
+        self.snapshot = snapshot;
+        self.generation = generation;
+        self.cancel();
+        Ok(())
+    }
+    pub(crate) fn validate_snapshot(&self, snapshot: &EvaluationSnapshot) -> Result<(), EvalError> {
         if snapshot.graph_id() != self.snapshot.graph_id() {
             return Err(EvalError::ForeignGraph);
         }
@@ -201,12 +231,6 @@ impl<R: Send + 'static> TaskCoordinator<R> {
                 active: self.snapshot.definition_epoch(),
             });
         }
-        if snapshot.id() == self.snapshot.id() && generation == self.generation {
-            return Ok(());
-        }
-        self.snapshot = snapshot;
-        self.generation = generation;
-        self.cancel();
         Ok(())
     }
     /// Cancel queued jobs and mark running jobs obsolete without releasing quota.

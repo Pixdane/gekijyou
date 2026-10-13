@@ -1,4 +1,4 @@
-use crate::{RuntimeGeneration, TaskCoordinator, TaskLimits, TaskStats};
+use crate::{RequestGeneration, TaskCoordinator, TaskLimits, TaskStats};
 use bevy_tasks::TaskPool;
 use gekijyou_computation::{
     ComputeCompletion, ComputeTask, EvalError, EvaluationPlan, EvaluationResults,
@@ -44,17 +44,35 @@ impl Executor for BevyExecutor<'_> {
 /// so canceled workers cannot evade the global task quota. The Mutex wraps only
 /// coordinator-owned lifecycle metadata for Bevy Resource's Sync bound; workers
 /// never acquire it and never read or write the evaluator cache.
+///
+/// ```
+/// use bevy_tasks::TaskPoolBuilder;
+/// use gekijyou_bevy::{AsyncDriver, TaskLimits};
+/// use gekijyou_computation::{GraphState, Evaluator, FrameIndex, RequestBatch, PlannerConfig};
+/// let mut state = GraphState::new();
+/// let node = state.edit(|e| e.map(e.frame(), |f: &FrameIndex| f.0))?;
+/// let mut evaluator = Evaluator::new(&state);
+/// let mut driver = AsyncDriver::new(state.snapshot(), TaskLimits { max_in_flight: 2, max_pending: 4 });
+/// let pool = TaskPoolBuilder::new().num_threads(2).build();
+/// let mut batch = RequestBatch::new();
+/// let id = batch.at(FrameIndex(20)).request(node);
+/// let generation = driver.begin(&mut evaluator, state.snapshot(), batch, PlannerConfig::default())?;
+/// let results = loop {
+///     if let Some((results, _)) = driver.poll(&mut evaluator, &pool)? { break results; }
+///     std::thread::yield_now();
+/// };
+/// assert_eq!(results.get(id)?, &20);
+/// assert!(!driver.cancel(generation)); // A delivered request is already finished.
+/// # Ok::<(), gekijyou_computation::EvalError>(())
+/// ```
 pub struct AsyncDriver {
     tracker: Mutex<TaskCoordinator<ComputeCompletion>>,
     plan: Option<EvaluationPlan>,
-    generation: RuntimeGeneration,
+    generation: RequestGeneration,
 }
 impl AsyncDriver {
-    pub fn new(
-        snapshot: EvaluationSnapshot,
-        generation: RuntimeGeneration,
-        limits: TaskLimits,
-    ) -> Self {
+    pub fn new(snapshot: EvaluationSnapshot, limits: TaskLimits) -> Self {
+        let generation = RequestGeneration::new();
         Self {
             tracker: Mutex::new(TaskCoordinator::new(snapshot, generation, limits)),
             plan: None,
@@ -66,7 +84,7 @@ impl AsyncDriver {
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
-    pub fn generation(&self) -> RuntimeGeneration {
+    pub fn generation(&self) -> RequestGeneration {
         self.generation
     }
     pub fn stats(&mut self) -> TaskStats {
@@ -75,30 +93,38 @@ impl AsyncDriver {
     pub fn in_flight(&mut self) -> usize {
         self.tracker().in_flight()
     }
-    pub fn cancel(
-        &mut self,
-        snapshot: EvaluationSnapshot,
-        generation: RuntimeGeneration,
-    ) -> Result<(), EvalError> {
+    /// Explicitly cancels the active request. An old token cannot cancel its
+    /// successor. Running workers retain quota and immutable data until terminal.
+    pub fn cancel(&mut self, generation: RequestGeneration) -> bool {
+        if generation != self.generation || self.plan.is_none() {
+            return false;
+        }
+        self.tracker().cancel();
         if let Some(mut plan) = self.plan.take() {
             plan.cancel();
         }
-        self.tracker().set_session(snapshot, generation)?;
-        self.tracker().cancel();
-        self.generation = generation;
-        Ok(())
+        true
     }
+    /// Replaces the active request with a fresh identity, even on the same snapshot.
+    /// Cache histories are managed by Evaluator, independently of cancellation.
     pub fn begin(
         &mut self,
         evaluator: &mut Evaluator,
         snapshot: EvaluationSnapshot,
-        generation: RuntimeGeneration,
         batch: RequestBatch,
         config: PlannerConfig,
-    ) -> Result<(), EvalError> {
-        self.cancel(snapshot.clone(), generation)?;
-        self.plan = Some(evaluator.plan(snapshot, batch, config)?);
-        Ok(())
+    ) -> Result<RequestGeneration, EvalError> {
+        // Validate before canceling a valid existing request.
+        self.tracker().validate_snapshot(&snapshot)?;
+        let plan = evaluator.plan(snapshot.clone(), batch, config)?;
+        let generation = RequestGeneration::new();
+        self.tracker().set_session(snapshot, generation)?;
+        if let Some(mut old) = self.plan.take() {
+            old.cancel();
+        }
+        self.plan = Some(plan);
+        self.generation = generation;
+        Ok(generation)
     }
     /// Polling always reclaims obsolete completions, even when no plan is active.
     /// Errors fail the entire request; completed pure cache entries may survive.

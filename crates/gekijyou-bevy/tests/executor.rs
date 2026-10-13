@@ -1,14 +1,11 @@
 use bevy_ecs::prelude::*;
 use bevy_math::Vec3;
-use bevy_tasks::TaskPoolBuilder;
+use bevy_tasks::{TaskPool, TaskPoolBuilder};
 use bevy_transform::components::Transform;
-use gekijyou_bevy::{
-    AnimationRuntime, AsyncDriver, BevyExecutor, BindingError, Bindings, FrameStatus, OutputField,
-    TaskLimits,
-};
+use gekijyou_bevy::{AsyncDriver, BevyExecutor, Bindings, OutputField, TaskLimits};
 use gekijyou_computation::{
-    CachePolicy, EvalError, Evaluator, FrameIndex, GraphState, NodeCacheConfig, PlannerConfig,
-    RequestBatch,
+    CachePolicy, EvalError, EvaluationResults, Evaluator, FrameIndex, GraphState, NodeCacheConfig,
+    PlannerConfig, RequestBatch,
 };
 use std::{
     sync::{
@@ -22,6 +19,22 @@ fn off() -> NodeCacheConfig {
     NodeCacheConfig {
         memo: CachePolicy::Off,
         context: CachePolicy::Off,
+    }
+}
+fn limits() -> TaskLimits {
+    TaskLimits {
+        max_in_flight: 1,
+        max_pending: 1,
+    }
+}
+fn complete(driver: &mut AsyncDriver, eval: &mut Evaluator, pool: &TaskPool) -> EvaluationResults {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some((results, _)) = driver.poll(eval, pool).unwrap() {
+            return results;
+        }
+        assert!(Instant::now() < deadline, "request did not complete");
+        std::thread::yield_now();
     }
 }
 
@@ -105,15 +118,16 @@ fn panic_inside_a_chunk_fails_successors_without_stranding_other_tasks() {
         0
     );
 }
+
 #[test]
-fn runtime_cancel_keeps_old_quota_and_never_applies_old_definition() {
+fn definition_edits_and_repeated_replacement_keep_old_worker_quota_until_terminal() {
     let pool = TaskPoolBuilder::new().num_threads(2).build();
-    let mut runtime = AnimationRuntime::new(2);
+    let mut state = GraphState::new();
     let mut world = World::new();
     let entity = world.spawn(Transform::default()).id();
     let gate = Arc::new((Mutex::new(false), Condvar::new()));
     let (start_tx, start_rx) = mpsc::channel();
-    let node = runtime
+    let node = state
         .edit(|e| {
             let gate = gate.clone();
             e.map((), move || {
@@ -127,159 +141,273 @@ fn runtime_cancel_keeps_old_quota_and_never_applies_old_definition() {
             })
         })
         .unwrap();
-    runtime.configure_cache(node, off()).unwrap();
+    let mut eval = Evaluator::new(&state);
+    eval.configure_cache(node, off()).unwrap();
     let mut bindings = Bindings::new();
     bindings
         .bind_output(
-            runtime.snapshot(),
+            &state.snapshot(),
             entity,
             node,
             OutputField::transform_translation(),
         )
         .unwrap();
-    runtime
-        .enable_async(TaskLimits {
-            max_in_flight: 1,
-            max_pending: 1,
-        })
+    let mut driver = AsyncDriver::new(state.snapshot(), limits());
+    let mut old = bindings
+        .request(&state.snapshot(), &[FrameIndex(0)])
         .unwrap();
-    runtime
-        .begin_prepare(&bindings, &[FrameIndex(0)], PlannerConfig::default())
+    let old_generation = driver
+        .begin(
+            &mut eval,
+            state.snapshot(),
+            old.take_batch().unwrap(),
+            PlannerConfig::default(),
+        )
         .unwrap();
-    assert!(!runtime.poll_prepare(&pool, &bindings).unwrap());
-    start_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    runtime
+    assert!(driver.poll(&mut eval, &pool).unwrap().is_none());
+    start_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    state
         .edit(|e| e.replace(node, (), || Vec3::splat(2.)))
         .unwrap();
+    let mut bound = None;
     for _ in 0..20 {
-        runtime
-            .begin_prepare(&bindings, &[FrameIndex(0)], PlannerConfig::default())
+        let mut next = bindings
+            .request(&state.snapshot(), &[FrameIndex(0)])
             .unwrap();
-        runtime.poll_prepare(&pool, &bindings).unwrap();
-        assert_eq!(runtime.async_in_flight(), 1);
-        assert!(bindings.apply(&mut world, &runtime, FrameIndex(0)).is_err());
+        driver
+            .begin(
+                &mut eval,
+                state.snapshot(),
+                next.take_batch().unwrap(),
+                PlannerConfig::default(),
+            )
+            .unwrap();
+        assert!(!driver.cancel(old_generation));
+        assert!(driver.poll(&mut eval, &pool).unwrap().is_none());
+        assert_eq!(driver.in_flight(), 1);
+        bound = Some(next);
     }
-    {
-        let (lock, ready) = &*gate;
-        *lock.lock().unwrap() = true;
-        ready.notify_all();
-    }
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while runtime.prepared().status(FrameIndex(0)) != FrameStatus::Ready {
-        runtime.poll_prepare(&pool, &bindings).unwrap();
-        assert!(Instant::now() < deadline);
-        std::thread::yield_now();
-    }
-    bindings.apply(&mut world, &runtime, FrameIndex(0)).unwrap();
+    let (lock, ready) = &*gate;
+    *lock.lock().unwrap() = true;
+    ready.notify_all();
+    let results = complete(&mut driver, &mut eval, &pool);
+    bindings
+        .apply(
+            &mut world,
+            &state.snapshot(),
+            &bound.unwrap(),
+            &results,
+            FrameIndex(0),
+        )
+        .unwrap();
     assert_eq!(
         world.get::<Transform>(entity).unwrap().translation,
         Vec3::splat(2.)
     );
-    let stats = runtime.async_task_stats().unwrap();
+    let stats = driver.stats();
     assert_eq!(stats.peak_in_flight, 1);
     assert_eq!(stats.terminal, 2);
     assert_eq!(stats.obsolete, 1);
     assert!(stats.canceled_pending >= 19);
+    assert_eq!(eval.stats().computation_calls, 1);
 }
+
 #[test]
-fn async_worker_failure_is_visible_as_a_failed_complete_frame() {
+fn worker_failure_is_terminal_and_never_delivers_partial_results() {
     let pool = TaskPoolBuilder::new().num_threads(1).build();
-    let mut runtime = AnimationRuntime::new(1);
+    let mut state = GraphState::new();
+    let (good, bad) = state
+        .edit(|e| Ok((e.constant(1_u64), e.map((), || -> u64 { panic!("async") })?)))
+        .unwrap();
+    let mut eval = Evaluator::new(&state);
+    let mut driver = AsyncDriver::new(state.snapshot(), limits());
+    let mut batch = RequestBatch::new();
+    batch.at(FrameIndex(0)).request(good);
+    batch.at(FrameIndex(0)).request(bad);
+    driver
+        .begin(&mut eval, state.snapshot(), batch, PlannerConfig::default())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match driver.poll(&mut eval, &pool) {
+            Ok(None) => (),
+            Err(EvalError::WorkerPanicked) => break,
+            _ => panic!("unexpected terminal result"),
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    while driver.in_flight() > 0 {
+        assert!(driver.poll(&mut eval, &pool).unwrap().is_none());
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert_eq!(driver.stats().failed, 1);
+    let mut retry = RequestBatch::new();
+    let id = retry.at(FrameIndex(0)).request(good);
+    driver
+        .begin(&mut eval, state.snapshot(), retry, PlannerConfig::default())
+        .unwrap();
+    assert_eq!(complete(&mut driver, &mut eval, &pool).get(id).unwrap(), &1);
+}
+
+#[test]
+fn same_snapshot_requests_have_distinct_identities_and_old_cancel_tokens_are_harmless() {
+    let pool = TaskPoolBuilder::new().num_threads(1).build();
+    let mut state = GraphState::new();
+    let node = state.edit(|e| Ok(e.constant(3_u64))).unwrap();
+    let snapshot = state.snapshot();
+    let mut eval = Evaluator::new(&state);
+    let mut driver = AsyncDriver::new(snapshot.clone(), limits());
+    let mut old = RequestBatch::new();
+    old.at(FrameIndex(0)).request(node);
+    let generation = driver
+        .begin(&mut eval, snapshot.clone(), old, PlannerConfig::default())
+        .unwrap();
+    driver.poll(&mut eval, &pool).unwrap();
+    let mut new = RequestBatch::new();
+    let id = new.at(FrameIndex(1)).request(node);
+    let successor = driver
+        .begin(&mut eval, snapshot.clone(), new, PlannerConfig::default())
+        .unwrap();
+    assert_ne!(generation, successor);
+    assert!(!driver.cancel(generation));
+    let results = complete(&mut driver, &mut eval, &pool);
+    assert_eq!(results.get(id).unwrap(), &3);
+    assert_eq!(results.snapshot_id(), snapshot.id());
+    assert_eq!(driver.in_flight(), 0);
+}
+
+#[test]
+fn cancellation_is_explicit_and_preserves_existing_evaluator_history() {
+    let pool = TaskPoolBuilder::new().num_threads(1).build();
+    let mut state = GraphState::new();
+    let node = state
+        .edit(|e| e.map(e.frame(), |f: &FrameIndex| f.0))
+        .unwrap();
+    let snapshot = state.snapshot();
+    let mut eval = Evaluator::new(&state);
+    assert_eq!(
+        *eval
+            .bind(snapshot.clone())
+            .unwrap()
+            .sample(FrameIndex(100), node)
+            .unwrap(),
+        100
+    );
+    let mut driver = AsyncDriver::new(snapshot.clone(), limits());
+    let mut batch = RequestBatch::new();
+    batch.at(FrameIndex(20)).request(node);
+    let generation = driver
+        .begin(&mut eval, snapshot.clone(), batch, PlannerConfig::default())
+        .unwrap();
+    assert!(driver.cancel(generation));
+    assert!(!driver.cancel(generation));
+    assert!(driver.poll(&mut eval, &pool).unwrap().is_none());
+    assert_eq!(driver.in_flight(), 0);
+    assert_eq!(
+        *eval
+            .bind(snapshot.clone())
+            .unwrap()
+            .sample(FrameIndex(100), node)
+            .unwrap(),
+        100
+    );
+    assert_eq!(eval.stats().computation_calls, 1);
+    assert_eq!(state.snapshot().id(), snapshot.id());
+}
+
+#[test]
+fn invalid_replacement_does_not_cancel_a_valid_request() {
+    let pool = TaskPoolBuilder::new().num_threads(1).build();
+    let mut state = GraphState::new();
+    let node = state.edit(|e| Ok(e.constant(8_u64))).unwrap();
+    let mut eval = Evaluator::new(&state);
+    let mut driver = AsyncDriver::new(state.snapshot(), limits());
+    let mut batch = RequestBatch::new();
+    let id = batch.at(FrameIndex(20)).request(node);
+    let generation = driver
+        .begin(&mut eval, state.snapshot(), batch, PlannerConfig::default())
+        .unwrap();
+    let foreign = GraphState::new();
+    assert_eq!(
+        driver.begin(
+            &mut eval,
+            foreign.snapshot(),
+            RequestBatch::new(),
+            PlannerConfig::default()
+        ),
+        Err(EvalError::ForeignGraph)
+    );
+    assert_eq!(driver.generation(), generation);
+    let invalid = PlannerConfig {
+        frame_window: 0,
+        ..Default::default()
+    };
+    assert_eq!(
+        driver.begin(&mut eval, state.snapshot(), RequestBatch::new(), invalid),
+        Err(EvalError::InvalidPlannerConfig)
+    );
+    assert_eq!(driver.generation(), generation);
+    assert_eq!(complete(&mut driver, &mut eval, &pool).get(id).unwrap(), &8);
+}
+
+#[test]
+fn async_completed_selection_can_be_held_and_applied_repeatedly() {
+    let pool = TaskPoolBuilder::new().num_threads(2).build();
+    let mut state = GraphState::new();
+    let node = state
+        .edit(|e| e.map(e.frame(), |f: &FrameIndex| Vec3::splat(f.0 as f32)))
+        .unwrap();
+    let snapshot = state.snapshot();
     let mut world = World::new();
     let entity = world.spawn(Transform::default()).id();
-    let node = runtime
-        .edit(|e| e.map((), || -> Vec3 { panic!("async") }))
-        .unwrap();
     let mut bindings = Bindings::new();
-    bindings
+    let output = bindings
         .bind_output(
-            runtime.snapshot(),
+            &snapshot,
             entity,
             node,
             OutputField::transform_translation(),
         )
         .unwrap();
-    runtime
-        .enable_async(TaskLimits {
-            max_in_flight: 1,
-            max_pending: 0,
-        })
+    let mut bound = bindings
+        .request_selected(
+            &snapshot,
+            &[FrameIndex(100), FrameIndex(20), FrameIndex(300)],
+            &[output],
+        )
         .unwrap();
-    runtime
-        .begin_prepare(&bindings, &[FrameIndex(0)], PlannerConfig::default())
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match runtime.poll_prepare(&pool, &bindings) {
-            Ok(_) => (),
-            Err(BindingError::Evaluation(EvalError::WorkerPanicked)) => break,
-            other => panic!("Unexpected poll {other:?}"),
-        }
-        assert!(Instant::now() < deadline);
-        std::thread::yield_now();
-    }
-    assert_eq!(runtime.async_in_flight(), 0);
-    assert_eq!(runtime.async_task_stats().unwrap().failed, 1);
-    assert_eq!(
-        runtime.prepared().status(FrameIndex(0)),
-        FrameStatus::Failed
-    );
-    assert!(bindings.apply(&mut world, &runtime, FrameIndex(0)).is_err());
-}
-#[test]
-fn async_driver_replacing_a_plan_in_the_same_generation_discards_old_messages() {
-    let pool = TaskPoolBuilder::new().num_threads(1).build();
-    let mut state = GraphState::new();
-    let node = state.edit(|e| Ok(e.constant(3_u64))).unwrap();
     let mut eval = Evaluator::new(&state);
-    let runtime = AnimationRuntime::new(1);
-    let mut driver = AsyncDriver::new(
-        state.snapshot(),
-        runtime.generation(),
-        TaskLimits {
-            max_in_flight: 1,
-            max_pending: 1,
-        },
-    );
-    let mut old = RequestBatch::new();
-    old.at(FrameIndex(0)).request(node);
+    let mut driver = AsyncDriver::new(snapshot.clone(), limits());
     driver
         .begin(
             &mut eval,
-            state.snapshot(),
-            runtime.generation(),
-            old,
+            snapshot.clone(),
+            bound.take_batch().unwrap(),
             PlannerConfig::default(),
         )
         .unwrap();
-    driver.poll(&mut eval, &pool).unwrap();
-    let mut new = RequestBatch::new();
-    let id = new.at(FrameIndex(1)).request(node);
-    driver
-        .begin(
-            &mut eval,
-            state.snapshot(),
-            runtime.generation(),
-            new,
-            PlannerConfig::default(),
-        )
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        if let Some((results, _)) = driver.poll(&mut eval, &pool).unwrap() {
-            assert_eq!(results.get(id).unwrap(), &3);
-            break;
-        }
-        assert!(Instant::now() < deadline);
-        std::thread::yield_now();
+    let results = complete(&mut driver, &mut eval, &pool);
+    drop(driver);
+    drop(eval);
+    for f in [300, 20, 100, 20] {
+        bindings
+            .apply(&mut world, &snapshot, &bound, &results, FrameIndex(f))
+            .unwrap();
+        assert_eq!(
+            world.get::<Transform>(entity).unwrap().translation,
+            Vec3::splat(f as f32)
+        );
     }
-    assert_eq!(driver.in_flight(), 0);
 }
 
 #[test]
 fn cache_commit_panic_reclaims_worker_quota_and_allows_a_fresh_request() {
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::sync::atomic::AtomicBool;
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::atomic::AtomicBool,
+    };
     struct Value {
         frame: u64,
         panic: Arc<AtomicBool>,
@@ -292,14 +420,10 @@ fn cache_commit_panic_reclaims_worker_quota_and_allows_a_fresh_request() {
             );
         }
     }
-    #[derive(Component)]
-    struct Output(u64);
     let pool = TaskPoolBuilder::new().num_threads(1).build();
-    let mut world = World::new();
-    let entity = world.spawn(Output(0)).id();
     let flag = Arc::new(AtomicBool::new(false));
-    let mut runtime = AnimationRuntime::new(1);
-    let node = runtime
+    let mut state = GraphState::new();
+    let node = state
         .edit(|e| {
             let panic = flag.clone();
             e.map(e.frame(), move |f: &FrameIndex| Value {
@@ -308,53 +432,113 @@ fn cache_commit_panic_reclaims_worker_quota_and_allows_a_fresh_request() {
             })
         })
         .unwrap();
-    let mut bindings = Bindings::new();
-    bindings
-        .bind_output(
-            runtime.snapshot(),
-            entity,
-            node,
-            OutputField::new(|c: &mut Output, v: &Value| c.0 = v.frame),
-        )
-        .unwrap();
-    runtime.prepare(&bindings, &[FrameIndex(0)]).unwrap();
-    runtime
-        .enable_async(TaskLimits {
+    let mut eval = Evaluator::new(&state);
+    drop(
+        eval.bind(state.snapshot())
+            .unwrap()
+            .sample(FrameIndex(0), node)
+            .unwrap(),
+    );
+    let mut driver = AsyncDriver::new(
+        state.snapshot(),
+        TaskLimits {
             max_in_flight: 1,
             max_pending: 0,
-        })
+        },
+    );
+    let mut batch = RequestBatch::new();
+    batch.at(FrameIndex(1)).request(node);
+    driver
+        .begin(&mut eval, state.snapshot(), batch, PlannerConfig::default())
         .unwrap();
-    runtime
-        .begin_prepare(&bindings, &[FrameIndex(1)], PlannerConfig::default())
-        .unwrap();
-    runtime.poll_prepare(&pool, &bindings).unwrap();
+    driver.poll(&mut eval, &pool).unwrap();
     flag.store(true, Ordering::Relaxed);
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(5);
     assert!(
         catch_unwind(AssertUnwindSafe(|| loop {
-            runtime.poll_prepare(&pool, &bindings).unwrap();
+            driver.poll(&mut eval, &pool).unwrap();
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }))
         .is_err()
     );
     assert!(!flag.load(Ordering::Relaxed));
-    assert_eq!(runtime.async_in_flight(), 0);
-    assert_eq!(
-        runtime.frame_status(&bindings, FrameIndex(1)),
-        FrameStatus::Failed
-    );
-    runtime
-        .begin_prepare(&bindings, &[FrameIndex(1)], PlannerConfig::default())
+    assert_eq!(driver.in_flight(), 0);
+    assert!(driver.poll(&mut eval, &pool).unwrap().is_none());
+    let mut batch = RequestBatch::new();
+    let id = batch.at(FrameIndex(1)).request(node);
+    driver
+        .begin(&mut eval, state.snapshot(), batch, PlannerConfig::default())
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while runtime.frame_status(&bindings, FrameIndex(1)) != FrameStatus::Ready {
-        runtime.poll_prepare(&pool, &bindings).unwrap();
-        assert!(Instant::now() < deadline);
-        std::thread::yield_now();
+    assert_eq!(
+        complete(&mut driver, &mut eval, &pool)
+            .get(id)
+            .unwrap()
+            .frame,
+        1
+    );
+    assert_eq!(driver.stats().terminal, 2);
+    assert_eq!(eval.stats().computation_calls, 3);
+}
+
+#[test]
+fn explicit_serial_and_parallel_planner_results_apply_to_ecs() {
+    use bevy_math::Quat;
+    use gekijyou_computation::SerialExecutor;
+    let pool = TaskPoolBuilder::new().num_threads(2).build();
+    let mut state = GraphState::new();
+    let (position, rotation) = state
+        .edit(|e| {
+            Ok((
+                e.map(e.frame(), |f: &FrameIndex| Vec3::splat(f.0 as f32))?,
+                e.constant(Quat::from_rotation_z(0.5)),
+            ))
+        })
+        .unwrap();
+    let snapshot = state.snapshot();
+    let mut world = World::new();
+    let entity = world.spawn(Transform::default()).id();
+    let mut bindings = Bindings::new();
+    bindings
+        .bind_output(
+            &snapshot,
+            entity,
+            position,
+            OutputField::transform_translation(),
+        )
+        .unwrap();
+    bindings
+        .bind_output(
+            &snapshot,
+            entity,
+            rotation,
+            OutputField::transform_rotation(),
+        )
+        .unwrap();
+    for parallel in [false, true] {
+        let mut bound = bindings
+            .request(&snapshot, &[FrameIndex(100), FrameIndex(20)])
+            .unwrap();
+        let batch = bound.take_batch().unwrap();
+        let mut eval = Evaluator::new(&state);
+        let mut scope = eval.bind(snapshot.clone()).unwrap();
+        let (results, _) = if parallel {
+            scope.evaluate_planned(
+                batch,
+                PlannerConfig::default(),
+                &mut BevyExecutor::new(&pool, 4),
+            )
+        } else {
+            scope.evaluate_planned(batch, PlannerConfig::default(), &mut SerialExecutor)
+        }
+        .unwrap();
+        for f in [100, 20] {
+            bindings
+                .apply(&mut world, &snapshot, &bound, &results, FrameIndex(f))
+                .unwrap();
+            let transform = world.get::<Transform>(entity).unwrap();
+            assert_eq!(transform.translation, Vec3::splat(f as f32));
+            assert_eq!(transform.rotation, Quat::from_rotation_z(0.5));
+        }
     }
-    bindings.apply(&mut world, &runtime, FrameIndex(1)).unwrap();
-    assert_eq!(world.get::<Output>(entity).unwrap().0, 1);
-    assert_eq!(runtime.async_task_stats().unwrap().terminal, 2);
-    assert_eq!(runtime.stats().computation_calls, 3);
 }

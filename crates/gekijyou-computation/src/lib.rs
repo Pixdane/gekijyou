@@ -54,7 +54,7 @@ pub use node::{
 pub use snapshot::{EvaluationSnapshot, SnapshotId};
 
 pub use eval::{CacheStats, EvalStats, EvaluationScope, Evaluator};
-pub use request::{EvaluationResults, FrameRequests, RequestBatch, RequestId};
+pub use request::{EvaluationResults, FrameRequests, RequestBatch, RequestBatchId, RequestId};
 
 pub use value::SharedValue;
 

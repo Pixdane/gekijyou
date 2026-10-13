@@ -1,5 +1,5 @@
 use bevy_tasks::TaskPoolBuilder;
-use gekijyou_bevy::{AnimationRuntime, TaskCoordinator, TaskLimits, TaskStatus};
+use gekijyou_bevy::{RequestGeneration, TaskCoordinator, TaskLimits, TaskStatus};
 use gekijyou_computation::{EvalError, GraphState};
 use std::{
     sync::{
@@ -27,10 +27,10 @@ fn edits_and_repeated_cancellation_keep_old_workers_counted_until_terminal() {
             Ok(i)
         })
         .unwrap();
-    let mut runtime = AnimationRuntime::new(1);
+    let generation = RequestGeneration::new();
     let mut tasks = TaskCoordinator::new(
         state.snapshot(),
-        runtime.generation(),
+        generation,
         TaskLimits {
             max_in_flight: 1,
             max_pending: 1,
@@ -49,10 +49,8 @@ fn edits_and_repeated_cancellation_keep_old_workers_counted_until_terminal() {
     start_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     state.edit(|e| e.set(input, Probe(drops.clone()))).unwrap();
     for _ in 0..20 {
-        runtime.pause();
-        tasks
-            .set_session(state.snapshot(), runtime.generation())
-            .unwrap();
+        let generation = RequestGeneration::new();
+        tasks.set_session(state.snapshot(), generation).unwrap();
         assert_eq!(tasks.in_flight(), 1);
         assert_eq!(tasks.status(old), Some(TaskStatus::CanceledRunning));
         tasks.submit(&pool, |_| 8).unwrap();
@@ -78,10 +76,10 @@ fn edits_and_repeated_cancellation_keep_old_workers_counted_until_terminal() {
 fn worker_panic_is_terminal_and_a_new_job_can_use_the_slot() {
     let pool = TaskPoolBuilder::new().num_threads(1).build();
     let state = GraphState::new();
-    let runtime = AnimationRuntime::new(1);
+    let generation = RequestGeneration::new();
     let mut tasks = TaskCoordinator::<u64>::new(
         state.snapshot(),
-        runtime.generation(),
+        generation,
         TaskLimits {
             max_in_flight: 1,
             max_pending: 1,
@@ -112,10 +110,10 @@ fn worker_panic_is_terminal_and_a_new_job_can_use_the_slot() {
 fn session_definitions_cannot_roll_back_even_after_old_completion() {
     let mut state = GraphState::new();
     let old = state.snapshot();
-    let runtime = AnimationRuntime::new(1);
+    let generation = RequestGeneration::new();
     let mut tasks = TaskCoordinator::<()>::new(
         old.clone(),
-        runtime.generation(),
+        generation,
         TaskLimits {
             max_in_flight: 1,
             max_pending: 0,
@@ -127,11 +125,9 @@ fn session_definitions_cannot_roll_back_even_after_old_completion() {
             Ok(())
         })
         .unwrap();
-    tasks
-        .set_session(state.snapshot(), runtime.generation())
-        .unwrap();
+    tasks.set_session(state.snapshot(), generation).unwrap();
     assert!(matches!(
-        tasks.set_session(old, runtime.generation()),
+        tasks.set_session(old, generation),
         Err(EvalError::StaleGraphDefinition { .. })
     ));
 }

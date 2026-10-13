@@ -1,12 +1,19 @@
-use crate::{AnimationRuntime, runtime::PreparedFrame};
 use bevy_ecs::{component::Mutable, prelude::*};
 use bevy_math::{Quat, Vec3};
 use bevy_transform::components::Transform;
 use gekijyou_computation::{
     EvalError, EvaluationResults, EvaluationSnapshot, FrameIndex, GraphEdit, GraphError, GraphId,
-    Input, Node, NodeId, RequestBatch, SharedValue,
+    GraphState, Input, Node, NodeId, RequestBatch, RequestBatchId, RequestId,
 };
-use std::{any::TypeId, collections::HashSet, marker::PhantomData, sync::Arc};
+use std::{
+    any::{Any, TypeId},
+    collections::{HashMap, HashSet},
+    marker::PhantomData,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
@@ -19,18 +26,24 @@ pub enum BindingError {
     InputConflict,
     #[error("Output component write ranges overlap")]
     OutputConflict,
-    #[error("Input/output ranges would implicitly feed playback output back into input")]
+    #[error("Input/output ranges would implicitly feed output back into input")]
     FeedbackConflict,
     #[error("Input source entity no longer exists")]
     MissingEntity,
     #[error("Bound component is missing")]
     MissingComponent,
-    #[error("Enable the async driver exactly once before async preparation")]
-    AsyncConfiguration,
-    #[error("Pause playback before publishing graph/input edits")]
-    Playing,
-    #[error("The complete current snapshot/generation/binding frame is not prepared")]
-    FrameNotReady,
+    #[error("Request belongs to another binding registry")]
+    ForeignBindings,
+    #[error("Bindings changed since this request was built")]
+    StaleBindings,
+    #[error("Application snapshot does not match the request/results")]
+    SnapshotMismatch,
+    #[error("Output handle does not belong to this registry or has been removed")]
+    UnknownOutput,
+    #[error("Frame was not included in this bound request")]
+    MissingFrame,
+    #[error("The request batch has already been taken")]
+    BatchTaken,
 }
 
 /// Custom components default to Whole. Fine fields are an explicit user assertion
@@ -85,6 +98,8 @@ impl InputField<Transform, Vec3> {
 }
 
 /// Typed ECS writer; custom bindings conservatively own the whole component.
+/// Writers must preserve component invariants if they panic. Apply prevalidates
+/// values/components, but cannot roll back earlier ECS writes after a user panic.
 pub struct OutputField<C, T> {
     write: Arc<Writer<C, T>>,
     range: WriteRange,
@@ -152,9 +167,11 @@ impl Destination {
 type Check = dyn Fn(&EvaluationSnapshot) -> Result<(), GraphError> + Send + Sync;
 type SyncInput = dyn Fn(&World, &mut GraphEdit) -> Result<(), BindingError> + Send + Sync;
 type ValidateComponent = dyn Fn(&World) -> Result<(), BindingError> + Send + Sync;
-type ApplyOutput = dyn Fn(&mut World, &PreparedFrame) -> Result<(), BindingError> + Send + Sync;
-type ReadOutput = dyn Fn(&EvaluationResults) -> Result<SharedValue, EvalError> + Send + Sync;
-type RequestOutput = dyn Fn(&mut RequestBatch, FrameIndex) -> Box<ReadOutput> + Send + Sync;
+type ApplyOutput = dyn Fn(&mut World, &EvaluationResults) -> Result<(), BindingError> + Send + Sync;
+type ValidateResult = dyn Fn(&EvaluationResults) -> Result<(), EvalError> + Send + Sync;
+type RequestIds = HashMap<(FrameIndex, NodeKey), Box<dyn Any + Send + Sync>>;
+type RequestOutput =
+    dyn Fn(&mut RequestBatch, &mut RequestIds, FrameIndex) -> RequestedOutput + Send + Sync;
 struct InputEntry {
     key: NodeKey,
     source: Destination,
@@ -162,27 +179,73 @@ struct InputEntry {
     sync: Box<SyncInput>,
 }
 struct OutputEntry {
-    key: NodeKey,
+    id: u64,
     target: Destination,
     check: Box<Check>,
     request: Box<RequestOutput>,
     validate_component: Box<ValidateComponent>,
+}
+struct RequestedOutput {
+    validate: Box<ValidateResult>,
     apply: Box<ApplyOutput>,
 }
-pub(crate) struct PlannedOutput {
-    pub(crate) frame: FrameIndex,
-    pub(crate) key: NodeKey,
-    pub(crate) read: Box<ReadOutput>,
+struct PlannedOutput {
+    frame: FrameIndex,
+    entry: usize,
+    output: RequestedOutput,
 }
 
-/// Long-lived Node bindings. RequestIds are generated only for a preparation batch.
+/// Stable output selection handle. Pruning never reuses a removed handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OutputBinding {
+    registry: u64,
+    id: u64,
+}
+
+/// Frozen mapping between an explicit output/frame selection and its typed batch.
+/// Taking the batch leaves the mapping available for repeated or delayed Apply.
+/// This retains the immutable computation basis, with no final-output frame cache.
+pub struct BoundRequest {
+    batch_id: RequestBatchId,
+    batch: Option<RequestBatch>,
+    snapshot: EvaluationSnapshot,
+    registry: u64,
+    revision: u64,
+    frames: HashSet<FrameIndex>,
+    outputs: Vec<PlannedOutput>,
+}
+impl BoundRequest {
+    pub fn snapshot(&self) -> &EvaluationSnapshot {
+        &self.snapshot
+    }
+    pub fn take_batch(&mut self) -> Result<RequestBatch, BindingError> {
+        self.batch.take().ok_or(BindingError::BatchTaken)
+    }
+}
+
+/// Long-lived Node bindings. RequestIds belong to each explicit bound request.
 /// One input has one authoritative source; outputs check conservative write ranges.
-#[derive(Resource, Default)]
+#[derive(Resource)]
 pub struct Bindings {
+    identity: u64,
     inputs: Vec<InputEntry>,
     outputs: Vec<OutputEntry>,
     revision: u64,
     graph: Option<GraphId>,
+}
+impl Default for Bindings {
+    fn default() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self {
+            identity: NEXT
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .expect("Binding identity exhausted"),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            revision: 0,
+            graph: None,
+        }
+    }
 }
 impl Bindings {
     pub fn new() -> Self {
@@ -251,7 +314,7 @@ impl Bindings {
         entity: Entity,
         node: Node<T>,
         field: OutputField<C, T>,
-    ) -> Result<(), BindingError> {
+    ) -> Result<OutputBinding, BindingError> {
         snapshot.graph().check(node)?;
         if self.graph.is_some_and(|id| id != snapshot.graph_id()) {
             return Err(GraphError::ForeignNode { node: node.id() }.into());
@@ -270,12 +333,35 @@ impl Bindings {
         self.advance();
         self.graph = Some(snapshot.graph_id());
         self.outputs.push(OutputEntry {
-            key: NodeKey::of(node),
+            id: self.revision,
             target,
             check: Box::new(move |s| s.graph().check(node)),
-            request: Box::new(move |batch, frame| {
-                let id = batch.at(frame).request(node);
-                Box::new(move |r| r.get_shared(id).map(|v| v as SharedValue))
+            request: Box::new(move |batch, ids, frame| {
+                let key = (frame, NodeKey::of(node));
+                let id = if let Some(id) = ids.get(&key) {
+                    *id.downcast_ref::<RequestId<T>>()
+                        .expect("Node output type is invariant")
+                } else {
+                    let id = batch.at(frame).request(node);
+                    ids.insert(key, Box::new(id));
+                    id
+                };
+                let write = field.write.clone();
+                RequestedOutput {
+                    validate: Box::new(move |results| results.get(id).map(|_| ())),
+                    apply: Box::new(move |world, results| {
+                        // Despawn after request construction is harmless; never retarget.
+                        if world.get_entity(entity).is_err() {
+                            return Ok(());
+                        }
+                        let value = results.get(id)?;
+                        let mut component = world
+                            .get_mut::<C>(entity)
+                            .ok_or(BindingError::MissingComponent)?;
+                        write(&mut component, value);
+                        Ok(())
+                    }),
+                }
             }),
             validate_component: Box::new(move |world| {
                 if world.get_entity(entity).is_err() {
@@ -286,24 +372,11 @@ impl Bindings {
                 }
                 Ok(())
             }),
-            apply: Box::new(move |world, frame| {
-                // Despawn between registration/preparation and application is harmless.
-                if world.get_entity(entity).is_err() {
-                    return Ok(());
-                }
-                let value = frame
-                    .values
-                    .get(&NodeKey::of(node))
-                    .and_then(|v| v.downcast_ref::<T>())
-                    .ok_or(BindingError::FrameNotReady)?;
-                let mut component = world
-                    .get_mut::<C>(entity)
-                    .ok_or(BindingError::MissingComponent)?;
-                (field.write)(&mut component, value);
-                Ok(())
-            }),
         });
-        Ok(())
+        Ok(OutputBinding {
+            registry: self.identity,
+            id: self.revision,
+        })
     }
     /// Clear invalid bindings without deleting shared graph nodes.
     pub fn prune(&mut self, world: &World, snapshot: &EvaluationSnapshot) -> usize {
@@ -318,51 +391,137 @@ impl Bindings {
         }
         removed
     }
-    pub(crate) fn sync(&self, world: &World, edit: &mut GraphEdit) -> Result<(), BindingError> {
-        for input in &self.inputs {
-            (input.sync)(world, edit)?;
+    /// Extracts all bound inputs in one transaction. Failure or panic publishes
+    /// no partial input changes. Callers decide when ECS changes warrant a sync.
+    pub fn sync_inputs(&self, world: &World, state: &mut GraphState) -> Result<(), BindingError> {
+        if self
+            .graph
+            .is_some_and(|id| id != state.snapshot().graph_id())
+        {
+            return Err(EvalError::ForeignGraph.into());
         }
-        Ok(())
+        state.try_edit(|edit| {
+            for input in &self.inputs {
+                (input.sync)(world, edit)?;
+            }
+            Ok(())
+        })
     }
-    pub(crate) fn plan(
+
+    /// Requests every registered output at the explicitly supplied frames.
+    pub fn request(
         &self,
         snapshot: &EvaluationSnapshot,
         frames: &[FrameIndex],
-    ) -> Result<(RequestBatch, Vec<PlannedOutput>), BindingError> {
-        for output in &self.outputs {
-            (output.check)(snapshot)?;
-        }
-        let mut batch = RequestBatch::new();
-        let mut requests = Vec::new();
-        let mut seen = HashSet::new();
-        for &frame in frames {
-            for output in &self.outputs {
-                if seen.insert((frame, output.key)) {
-                    requests.push(PlannedOutput {
-                        frame,
-                        key: output.key,
-                        read: (output.request)(&mut batch, frame),
-                    });
-                }
+    ) -> Result<BoundRequest, BindingError> {
+        self.request_entries(snapshot, frames, (0..self.outputs.len()).collect())
+    }
+
+    /// Completeness belongs to this selection, not all outputs in the registry.
+    /// Duplicate handles/frames are ignored; equal Frame/Node pairs share one typed
+    /// RequestId even when their values are written to several entities.
+    pub fn request_selected(
+        &self,
+        snapshot: &EvaluationSnapshot,
+        frames: &[FrameIndex],
+        outputs: &[OutputBinding],
+    ) -> Result<BoundRequest, BindingError> {
+        let mut entries = Vec::new();
+        for output in outputs {
+            if output.registry != self.identity {
+                return Err(BindingError::UnknownOutput);
+            }
+            let index = self
+                .outputs
+                .iter()
+                .position(|o| o.id == output.id)
+                .ok_or(BindingError::UnknownOutput)?;
+            if !entries.contains(&index) {
+                entries.push(index);
             }
         }
-        Ok((batch, requests))
+        self.request_entries(snapshot, frames, entries)
     }
-    /// Checks complete frame identity/requirements before any component is changed.
-    /// This method cannot evaluate or query computation caches.
+    fn request_entries(
+        &self,
+        snapshot: &EvaluationSnapshot,
+        frames: &[FrameIndex],
+        entries: Vec<usize>,
+    ) -> Result<BoundRequest, BindingError> {
+        if self.graph.is_some_and(|id| id != snapshot.graph_id()) {
+            return Err(EvalError::ForeignGraph.into());
+        }
+        for &entry in &entries {
+            (self.outputs[entry].check)(snapshot)?;
+        }
+        let mut batch = RequestBatch::new();
+        let mut ids = HashMap::new();
+        let mut seen = HashSet::new();
+        let mut outputs = Vec::new();
+        for &frame in frames {
+            if !seen.insert(frame) {
+                continue;
+            }
+            for &entry in &entries {
+                outputs.push(PlannedOutput {
+                    frame,
+                    entry,
+                    output: (self.outputs[entry].request)(&mut batch, &mut ids, frame),
+                });
+            }
+        }
+        Ok(BoundRequest {
+            batch_id: batch.id(),
+            batch: Some(batch),
+            snapshot: snapshot.clone(),
+            registry: self.identity,
+            revision: self.revision,
+            frames: seen,
+            outputs,
+        })
+    }
+
+    /// Applies an owned completed result against an explicit computation basis.
+    /// Pass the current GraphState snapshot to reject obsolete input/definition
+    /// results, or intentionally retain the request snapshot for offline consumption.
+    /// All selected nodes, typed RequestIds, components and identities are checked
+    /// before writing. Despawned destinations are skipped. Custom writer panics do
+    /// not roll back earlier writes. Apply never evaluates or touches caches.
     pub fn apply(
         &self,
         world: &mut World,
-        runtime: &AnimationRuntime,
+        snapshot: &EvaluationSnapshot,
+        request: &BoundRequest,
+        results: &EvaluationResults,
         frame: FrameIndex,
     ) -> Result<(), BindingError> {
-        let prepared = runtime.ready_frame(self.revision, frame)?;
-        for output in &self.outputs {
-            (output.check)(runtime.snapshot())?;
-            (output.validate_component)(world)?;
+        if request.registry != self.identity {
+            return Err(BindingError::ForeignBindings);
         }
-        for output in &self.outputs {
-            (output.apply)(world, prepared)?;
+        if request.revision != self.revision {
+            return Err(BindingError::StaleBindings);
+        }
+        if snapshot.graph_id() != request.snapshot.graph_id() {
+            return Err(EvalError::ForeignGraph.into());
+        }
+        if snapshot.id() != request.snapshot.id() || results.snapshot_id() != request.snapshot.id()
+        {
+            return Err(BindingError::SnapshotMismatch);
+        }
+        if results.batch_id() != request.batch_id {
+            return Err(EvalError::ForeignRequest.into());
+        }
+        if !request.frames.contains(&frame) {
+            return Err(BindingError::MissingFrame);
+        }
+        for output in request.outputs.iter().filter(|o| o.frame == frame) {
+            let entry = &self.outputs[output.entry];
+            (entry.check)(snapshot)?;
+            (entry.validate_component)(world)?;
+            (output.output.validate)(results)?;
+        }
+        for output in request.outputs.iter().filter(|o| o.frame == frame) {
+            (output.output.apply)(world, results)?;
         }
         Ok(())
     }

@@ -1,22 +1,13 @@
-use benchmark::{
-    options::{HELP, Options},
-    runner,
-    timing::Timer,
-};
+//! Timing only; run in release. Raw rotated backend samples retain full oracle checks.
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("{error}");
+    if cfg!(debug_assertions) {
+        eprintln!("Use --release");
         std::process::exit(2);
     }
-}
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(options) = Options::parse(std::env::args().skip(1))? else {
-        println!("{HELP}");
-        return Ok(());
-    };
-    if cfg!(debug_assertions) {
-        return Err("Use --release or --profile perf".into());
-    }
-    runner::run(&options, &mut Timer, &mut std::io::stdout().lock())?;
-    Ok(())
+    benchmark::backends::measure(
+        &mut benchmark::timing::Timer,
+        &mut std::io::stdout().lock(),
+        9,
+    )
+    .unwrap();
 }

@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/gekijyou-computation", "benchmark"]
-default-members = ["crates/gekijyou-computation"]
+members = ["crates/gekijyou-computation", "crates/gekijyou-bevy", "benchmark"]
+default-members = ["crates/gekijyou-computation", "crates/gekijyou-bevy"]
 resolver = "3"
 
 [workspace.package]
@@ -10,7 +10,13 @@ license = "GPL-3.0-only"
 
 [workspace.dependencies]
 gekijyou-computation = { path = "crates/gekijyou-computation" }
-slotmap = "1.1.1"
+gekijyou-bevy = { path = "crates/gekijyou-bevy" }
+bevy_app = "0.20.0"
+bevy_ecs = "0.20.0"
+bevy_transform = "0.20.0"
+bevy_math = "0.20.0"
+bevy_color = "0.20.0"
+bevy_tasks = { version = "0.20.0", features = ["multi_threaded"] }
 smallvec = "1.16.3"
 thiserror = "2.0.21"
 

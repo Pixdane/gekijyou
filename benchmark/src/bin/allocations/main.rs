@@ -1,26 +1,10 @@
+//! Requested-layout allocations and live peak, including every Bevy worker thread.
+//! Output retention is identical across backends; measurements do not represent RSS.
 mod counting;
-use benchmark::{
-    options::{HELP, Options},
-    runner,
-};
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("{error}");
+    if cfg!(debug_assertions) {
+        eprintln!("Use --release");
         std::process::exit(2);
     }
-}
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(options) = Options::parse(std::env::args().skip(1))? else {
-        println!("{HELP}");
-        return Ok(());
-    };
-    if cfg!(debug_assertions) {
-        return Err("Use --release or --profile perf".into());
-    }
-    runner::run(
-        &options,
-        &mut counting::Counter,
-        &mut std::io::stdout().lock(),
-    )?;
-    Ok(())
+    benchmark::backends::measure(&mut counting::Counter, &mut std::io::stdout().lock(), 3).unwrap();
 }

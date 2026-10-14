@@ -8,6 +8,11 @@ autobins = false
 
 [dependencies]
 gekijyou-computation.workspace = true
+gekijyou-bevy.workspace = true
+bevy_ecs.workspace = true
+bevy_math.workspace = true
+bevy_transform.workspace = true
+bevy_tasks.workspace = true
 
 [[bin]]
 name = "timing"
@@ -16,3 +21,15 @@ path = "src/bin/timing.rs"
 [[bin]]
 name = "allocations"
 path = "src/bin/allocations/main.rs"
+
+[[bin]]
+name = "snapshot_cost"
+path = "src/bin/snapshot_cost.rs"
+
+[[bin]]
+name = "bevy_scene"
+path = "src/bin/bevy_scene.rs"
+
+[[bin]]
+name = "async_execution"
+path = "src/bin/async_execution.rs"

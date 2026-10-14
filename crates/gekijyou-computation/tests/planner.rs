@@ -302,3 +302,86 @@ fn worker_panic_fails_the_plan_and_never_publishes_partial_results() {
     ));
     assert_eq!(eval.cache_stats().memo_entries, 0);
 }
+#[test]
+fn missing_unset_input_reports_originating_request_frame_not_frame_zero() {
+    let mut state = GraphState::new();
+    let (input, output) = state
+        .edit(|e| {
+            e.set_default_eq::<u64>();
+            let input = e.input::<u64>();
+            let mid = e.map(input.node(), |x: &u64| x + 1)?;
+            let output = e.map(mid, |x: &u64| x * 2)?;
+            Ok((input, output))
+        })
+        .unwrap();
+    let mut eval = Evaluator::new(&state);
+    for target in [input.node(), output] {
+        let mut batch = RequestBatch::new();
+        batch.at(FrameIndex(42)).request(target);
+        let error = eval
+            .bind(state.snapshot())
+            .unwrap()
+            .evaluate_planned(batch, PlannerConfig::default(), &mut SerialExecutor)
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            EvalError::MissingInput {
+                frame: FrameIndex(42),
+                node: input.node().id()
+            }
+        );
+        assert_eq!(
+            eval.bind(state.snapshot())
+                .unwrap()
+                .sample(FrameIndex(42), target),
+            Err(EvalError::MissingInput {
+                frame: FrameIndex(42),
+                node: input.node().id()
+            })
+        );
+    }
+}
+#[test]
+fn static_dependency_missing_input_reports_first_reached_request_frame() {
+    let mut state = GraphState::new();
+    let (healthy, missing_input, output) = state
+        .edit(|e| {
+            e.set_default_eq::<u64>();
+            let constant = e.map((), || 5_u64)?;
+            let input = e.input::<u64>();
+            let missing = e.map((constant, input.node()), |c: &u64, x: &u64| c + x)?;
+            let healthy = e.map(constant, |c: &u64| c + 1)?;
+            let output = e.map(
+                (healthy, missing, e.frame()),
+                |h: &u64, m: &u64, f: &FrameIndex| h + m + f.0,
+            )?;
+            Ok((healthy, input, output))
+        })
+        .unwrap();
+    let mut eval = Evaluator::new(&state);
+    eval.configure_cache(healthy, off()).unwrap();
+    for frame_window in [1, PlannerConfig::default().frame_window] {
+        let mut batch = RequestBatch::new();
+        batch.at(FrameIndex(7)).request(healthy);
+        batch.at(FrameIndex(43)).request(output);
+        batch.at(FrameIndex(42)).request(output);
+        let config = PlannerConfig {
+            frame_window,
+            ..Default::default()
+        };
+        let error = eval
+            .bind(state.snapshot())
+            .unwrap()
+            .evaluate_planned(batch, config, &mut SerialExecutor)
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            EvalError::MissingInput {
+                frame: FrameIndex(43),
+                node: missing_input.node().id()
+            }
+        );
+    }
+}

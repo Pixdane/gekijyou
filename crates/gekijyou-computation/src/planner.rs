@@ -130,6 +130,10 @@ impl Executor for SerialExecutor {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Canonical sharing key. `frame: None` shares static nodes within the active
+/// window; `frame()` substitutes `FrameIndex(0)` only for execution/context
+/// internals. The originating request frame is carried independently by
+/// `start_window` traversal so `MissingInput` reports the requesting frame.
 struct ResolutionKey {
     node: NodeId,
     frame: Option<FrameIndex>,
@@ -259,8 +263,13 @@ impl EvaluationPlan {
                 window.targets.push((index, self.key(r.node, r.frame)?));
             }
         }
-        let mut stack: Vec<_> = window.targets.iter().map(|(_, k)| *k).rev().collect();
-        while let Some(key) = stack.pop() {
+        let mut stack: Vec<(ResolutionKey, FrameIndex)> = window
+            .targets
+            .iter()
+            .map(|&(index, key)| (key, self.batch.as_ref().unwrap().requests[index].frame))
+            .rev()
+            .collect();
+        while let Some((key, origin)) = stack.pop() {
             if window.resolutions.contains_key(&key) {
                 continue;
             }
@@ -284,7 +293,7 @@ impl EvaluationPlan {
                     NodeKind::Input => (
                         Some(self.snapshot.inputs.get(&key.node).cloned().ok_or(
                             EvalError::MissingInput {
-                                frame: key.frame(),
+                                frame: origin,
                                 node: key.node,
                             },
                         )?),
@@ -295,7 +304,7 @@ impl EvaluationPlan {
                             .iter()
                             .map(|i| self.key(i.source, key.frame()))
                             .collect::<Result<Vec<_>, _>>()?;
-                        stack.extend(dependencies.iter().rev().copied());
+                        stack.extend(dependencies.iter().rev().map(|&key| (key, origin)));
                         (None, dependencies)
                     }
                 }

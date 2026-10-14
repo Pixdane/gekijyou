@@ -1,6 +1,6 @@
 use gekijyou_computation::{
-    CachePolicy, EvalError, Evaluator, FrameIndex, GraphState, NodeCacheConfig, PlannerConfig,
-    RequestBatch, SerialExecutor,
+    CachePolicy, EvalError, Evaluator, FrameIndex, GraphError, GraphState, NodeCacheConfig,
+    PlannerConfig, RequestBatch, SerialExecutor,
 };
 use std::sync::{
     Arc,
@@ -11,6 +11,58 @@ fn off() -> NodeCacheConfig {
         memo: CachePolicy::Off,
         context: CachePolicy::Off,
     }
+}
+#[test]
+fn invalid_new_definition_batch_preserves_old_scope_and_cache_history() {
+    let mut state = GraphState::new();
+    let node = state.edit(|e| Ok(e.constant(7_u64))).unwrap();
+    let old = state.snapshot();
+    let mut eval = Evaluator::new(&state);
+    eval.configure_cache(
+        node,
+        NodeCacheConfig {
+            memo: CachePolicy::Last,
+            context: CachePolicy::Last,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        *eval
+            .bind(old.clone())
+            .unwrap()
+            .sample(FrameIndex(0), node)
+            .unwrap(),
+        7
+    );
+    let stats = eval.stats();
+    let caches = eval.cache_stats();
+    let deleted = state.edit(|e| Ok(e.constant(9_u64))).unwrap();
+    state.edit(|e| e.remove(deleted)).unwrap();
+    let mut foreign = GraphState::new();
+    let foreign_node = foreign.edit(|e| Ok(e.constant(3_u64))).unwrap();
+    for (invalid_node, expected) in [
+        (
+            foreign_node,
+            GraphError::ForeignNode {
+                node: foreign_node.id(),
+            },
+        ),
+        (deleted, GraphError::MissingNode { node: deleted.id() }),
+    ] {
+        let mut batch = RequestBatch::new();
+        batch.at(FrameIndex(0)).request(invalid_node);
+        assert!(
+            matches!(eval.plan(state.snapshot(), batch, PlannerConfig::default()), Err(EvalError::Graph(error)) if error == expected)
+        );
+        assert_eq!(eval.stats(), stats);
+        assert_eq!(eval.cache_stats(), caches);
+    }
+    assert_eq!(
+        *eval.bind(old).unwrap().sample(FrameIndex(0), node).unwrap(),
+        7
+    );
+    assert_eq!(eval.stats().context_hits, stats.context_hits + 1);
+    assert_eq!(eval.stats().computation_calls, stats.computation_calls);
 }
 #[test]
 fn planner_matches_dfs_and_shares_content_then_identity_within_a_window() {

@@ -128,7 +128,37 @@ impl AsyncDriver {
     }
     /// Polling always reclaims obsolete completions, even when no plan is active.
     /// Errors fail the entire request; completed pure cache entries may survive.
+    /// Panics also terminate the active request before resuming unwinding,
+    /// including panics while dropping obsolete completion payloads.
     pub fn poll(
+        &mut self,
+        evaluator: &mut Evaluator,
+        pool: &TaskPool,
+    ) -> Result<Option<(EvaluationResults, PlannerStats)>, EvalError> {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.poll_inner(evaluator, pool)
+        }));
+        match outcome {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(error)) => {
+                self.fail_active_request();
+                Err(error)
+            }
+            Err(panic) => {
+                self.fail_active_request();
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+    fn fail_active_request(&mut self) {
+        // Detach first: dropping pending jobs or plan values may run user code.
+        let plan = self.plan.take();
+        self.tracker().cancel();
+        if let Some(mut plan) = plan {
+            plan.cancel();
+        }
+    }
+    fn poll_inner(
         &mut self,
         evaluator: &mut Evaluator,
         pool: &TaskPool,
@@ -136,38 +166,13 @@ impl AsyncDriver {
         let finished = self.tracker().poll_completions();
         let mut completed = Vec::new();
         for task in finished {
-            match task.result {
-                Ok(value) => completed.push(value),
-                Err(error) => {
-                    if let Some(mut plan) = self.plan.take() {
-                        plan.cancel();
-                    }
-                    self.tracker().cancel();
-                    return Err(error);
-                }
-            }
+            completed.push(task.result?);
         }
         let slots = self.tracker().available();
         let Some(plan) = self.plan.as_mut() else {
             return Ok(None);
         };
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            evaluator.advance_with_budget(plan, completed, slots)
-        }));
-        let tasks = match outcome {
-            Ok(Ok(tasks)) => tasks,
-            Ok(Err(error)) => {
-                self.plan = None;
-                self.tracker().cancel();
-                return Err(error);
-            }
-            Err(panic) => {
-                self.plan = None;
-                self.tracker().cancel();
-                std::panic::resume_unwind(panic);
-            }
-        };
-        let plan = self.plan.as_mut().unwrap();
+        let tasks = evaluator.advance_with_budget(plan, completed, slots)?;
         if plan.is_complete() {
             return self.plan.take().unwrap().finish().map(Some);
         }

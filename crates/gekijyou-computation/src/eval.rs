@@ -126,7 +126,7 @@ impl Evaluator {
         drop((memo, context));
         Ok(())
     }
-    pub fn bind(&mut self, snapshot: EvaluationSnapshot) -> Result<EvaluationScope<'_>, EvalError> {
+    pub(crate) fn validate_snapshot(&self, snapshot: &EvaluationSnapshot) -> Result<(), EvalError> {
         if snapshot.graph_id() != self.graph.id {
             return Err(EvalError::ForeignGraph);
         }
@@ -136,6 +136,10 @@ impl Evaluator {
                 active: self.graph.epoch,
             });
         }
+        Ok(())
+    }
+    pub fn bind(&mut self, snapshot: EvaluationSnapshot) -> Result<EvaluationScope<'_>, EvalError> {
+        self.validate_snapshot(&snapshot)?;
         if snapshot.definition_epoch() > self.graph.epoch {
             let old_context = std::mem::take(&mut self.cache.context);
             self.graph = snapshot.graph.clone();

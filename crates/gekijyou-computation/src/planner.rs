@@ -578,10 +578,13 @@ impl Evaluator {
         {
             return Err(EvalError::InvalidPlannerConfig);
         }
-        self.bind(snapshot.clone())?;
+        // Validate the entire request before advancing definitions or clearing
+        // cache histories: a rejected replacement must leave old plans usable.
+        self.validate_snapshot(&snapshot)?;
         for r in &batch.requests {
             snapshot.graph.check_node(r.graph, r.node, r.ty)?;
         }
+        self.bind(snapshot.clone())?;
         let mut seen = HashSet::default();
         let frames = batch
             .requests

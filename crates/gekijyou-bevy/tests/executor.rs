@@ -4,8 +4,8 @@ use bevy_tasks::{TaskPool, TaskPoolBuilder};
 use bevy_transform::components::Transform;
 use gekijyou_bevy::{AsyncDriver, BevyExecutor, Bindings, OutputField, TaskLimits};
 use gekijyou_computation::{
-    CachePolicy, EvalError, EvaluationResults, Evaluator, FrameIndex, GraphState, NodeCacheConfig,
-    PlannerConfig, RequestBatch,
+    CachePolicy, EvalError, EvaluationResults, Evaluator, FrameIndex, GraphError, GraphState,
+    NodeCacheConfig, PlannerConfig, RequestBatch,
 };
 use std::{
     sync::{
@@ -349,7 +349,127 @@ fn invalid_replacement_does_not_cancel_a_valid_request() {
         Err(EvalError::InvalidPlannerConfig)
     );
     assert_eq!(driver.generation(), generation);
+    let mut foreign = GraphState::new();
+    let foreign_node = foreign.edit(|e| Ok(e.constant(3_u64))).unwrap();
+    let deleted = state.edit(|e| Ok(e.constant(9_u64))).unwrap();
+    state.edit(|e| e.remove(deleted)).unwrap();
+    for (node, expected) in [
+        (
+            foreign_node,
+            GraphError::ForeignNode {
+                node: foreign_node.id(),
+            },
+        ),
+        (deleted, GraphError::MissingNode { node: deleted.id() }),
+    ] {
+        let mut invalid = RequestBatch::new();
+        invalid.at(FrameIndex(20)).request(node);
+        assert_eq!(
+            driver.begin(
+                &mut eval,
+                state.snapshot(),
+                invalid,
+                PlannerConfig::default()
+            ),
+            Err(EvalError::Graph(expected))
+        );
+        assert_eq!(driver.generation(), generation);
+        assert_eq!(eval.stats().definition_syncs, 0);
+    }
     assert_eq!(complete(&mut driver, &mut eval, &pool).get(id).unwrap(), &8);
+}
+
+#[test]
+fn obsolete_payload_drop_panic_terminates_active_request_and_allows_retry() {
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::atomic::AtomicBool,
+    };
+    struct Value(Arc<AtomicBool>);
+    impl Drop for Value {
+        fn drop(&mut self) {
+            assert!(
+                !self.0.swap(false, Ordering::Relaxed),
+                "obsolete payload destructor"
+            );
+        }
+    }
+    let pool = TaskPoolBuilder::new().num_threads(1).build();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let flag = Arc::new(AtomicBool::new(true));
+    let (started_tx, started_rx) = mpsc::channel();
+    let mut state = GraphState::new();
+    let (old, current) = state
+        .edit(|e| {
+            let gate = gate.clone();
+            let flag = flag.clone();
+            let old = e.map((), move || {
+                started_tx.send(()).unwrap();
+                let (lock, ready) = &*gate;
+                let mut open = lock.lock().unwrap();
+                while !*open {
+                    open = ready.wait(open).unwrap();
+                }
+                Value(flag.clone())
+            })?;
+            Ok((old, e.constant(42_u64)))
+        })
+        .unwrap();
+    let mut eval = Evaluator::new(&state);
+    let mut driver = AsyncDriver::new(state.snapshot(), limits());
+    let mut batch = RequestBatch::new();
+    batch.at(FrameIndex(0)).request(old);
+    let old_generation = driver
+        .begin(&mut eval, state.snapshot(), batch, PlannerConfig::default())
+        .unwrap();
+    assert!(driver.poll(&mut eval, &pool).unwrap().is_none());
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(driver.cancel(old_generation));
+    let mut batch = RequestBatch::new();
+    batch.at(FrameIndex(0)).request(current);
+    let generation = driver
+        .begin(&mut eval, state.snapshot(), batch, PlannerConfig::default())
+        .unwrap();
+    assert!(driver.poll(&mut eval, &pool).unwrap().is_none());
+    let (lock, ready) = &*gate;
+    *lock.lock().unwrap() = true;
+    ready.notify_all();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            while flag.load(Ordering::Relaxed) {
+                driver.poll(&mut eval, &pool).unwrap();
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+        }))
+        .is_err()
+    );
+    assert!(!flag.load(Ordering::Relaxed));
+    assert_eq!(driver.in_flight(), 0);
+    assert_eq!(driver.stats().terminal, 1);
+    assert_eq!(driver.stats().obsolete, 1);
+    assert!(
+        !driver.cancel(generation),
+        "unwinding must make the active request terminal"
+    );
+    assert!(driver.poll(&mut eval, &pool).unwrap().is_none());
+    assert_eq!(
+        driver.stats().dispatched,
+        1,
+        "queued successors must be canceled"
+    );
+    assert_eq!(driver.stats().canceled_pending, 1);
+    let mut batch = RequestBatch::new();
+    let id = batch.at(FrameIndex(0)).request(current);
+    driver
+        .begin(&mut eval, state.snapshot(), batch, PlannerConfig::default())
+        .unwrap();
+    assert_eq!(
+        complete(&mut driver, &mut eval, &pool).get(id).unwrap(),
+        &42
+    );
+    assert_eq!(driver.stats().terminal, 2);
 }
 
 #[test]

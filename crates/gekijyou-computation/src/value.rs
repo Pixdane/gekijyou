@@ -1,3 +1,4 @@
+use super::node::KernelId;
 use std::{any::Any, sync::Arc};
 
 /// Erased output storage; NodeRecord::type_id records the concrete output type.
@@ -6,6 +7,19 @@ pub type SharedValue = Arc<dyn Any + Send + Sync + 'static>;
 /// An erased computation whose arguments must match its input edges in order,
 /// count, and type.
 pub(super) type ErasedComputation = dyn Fn(&[&dyn Any]) -> SharedValue + Send + Sync + 'static;
+
+/// Erased vectorized batch computation: one parameter and ordered argument slice
+/// per element, producing one output per element in the same order.
+pub(crate) type ErasedBatchKernel =
+    dyn Fn(&[(&dyn Any, &[&dyn Any])]) -> Vec<SharedValue> + Send + Sync + 'static;
+
+/// Batch kernel identity plus the per-node parameter captured at insertion.
+#[derive(Clone)]
+pub(crate) struct BatchKernelRecord {
+    pub(crate) id: KernelId,
+    pub(crate) param: SharedValue,
+    pub(crate) kernel: Arc<ErasedBatchKernel>,
+}
 
 type Equivalence = dyn Fn(&dyn Any, &dyn Any) -> bool + Send + Sync + 'static;
 

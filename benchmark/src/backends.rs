@@ -593,12 +593,15 @@ impl BackendScene {
                         current
                     }
                 };
+                let rounds = config.rounds;
+                let actor_kernel =
+                    e.batch_kernel(move |items: &[(&u64, &u64)], out: &mut Vec<u64>| {
+                        for &(&actor, &p) in items {
+                            out.push(compute(p, actor, rounds));
+                        }
+                    });
                 let actor_nodes = (0..config.actors)
-                    .map(|actor| {
-                        e.map(source, move |p: &u64| {
-                            compute(*p, actor as u64, config.rounds)
-                        })
-                    })
+                    .map(|actor| e.map_batch(&actor_kernel, actor as u64, source))
                     .collect::<Result<Vec<_>, _>>()?;
                 computations.extend(actor_nodes.iter().copied());
                 Ok((computations, actor_nodes))

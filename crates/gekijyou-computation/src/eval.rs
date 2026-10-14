@@ -40,7 +40,7 @@ struct CacheStore {
 }
 #[derive(Default)]
 struct EvalScratch {
-    values: HashMap<(FrameIndex, NodeId), SharedValue>,
+    values: HashMap<(Option<FrameIndex>, NodeId), SharedValue>,
     frames: HashMap<FrameIndex, SharedValue>,
 }
 impl EvalScratch {
@@ -221,12 +221,13 @@ impl Evaluator {
             return Err(EvalError::DepthLimit { limit: MAX_DEPTH });
         }
         self.stats.resolution_visits += 1;
-        if let Some(value) = scratch.values.get(&(frame, node)) {
+        let record = snapshot.graph.node_record(node)?;
+        let key = (record.depends_on_frame.then_some(frame), node);
+        if let Some(value) = scratch.values.get(&key) {
             return Ok(value.clone());
         }
-        let record = snapshot.graph.node_record(node)?;
         if let Some(output) = self.context_lookup(snapshot, frame_value, node)? {
-            scratch.values.insert((frame, node), output.clone());
+            scratch.values.insert(key, output.clone());
             return Ok(output);
         }
         let value = match &record.kind {
@@ -239,6 +240,7 @@ impl Evaluator {
             NodeKind::Computation {
                 inputs,
                 computation,
+                ..
             } => {
                 let dependencies: SmallVec<[SharedValue; 4]> = inputs
                     .iter()
@@ -266,7 +268,7 @@ impl Evaluator {
             }
         };
         self.context_insert(snapshot, frame_value, node, value.clone());
-        scratch.values.insert((frame, node), value.clone());
+        scratch.values.insert(key, value.clone());
         Ok(value)
     }
     pub(crate) fn memo_lookup(

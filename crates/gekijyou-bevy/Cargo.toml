@@ -12,6 +12,7 @@ bevy_transform.workspace = true
 bevy_math.workspace = true
 bevy_tasks.workspace = true
 smallvec.workspace = true
+rustc-hash.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

@@ -47,14 +47,20 @@ mod value;
 
 pub use error::{EvalError, GraphError};
 pub use graph::{Graph, GraphEdit, GraphState};
-pub use inputs::{ComputationDefinition, ComputationInputs};
+pub use inputs::{
+    BatchInputNodes, BatchInputs, BatchKernel, BatchNodeDefinition, ComputationDefinition,
+    ComputationInputs,
+};
 pub use node::{
-    CachePolicy, FrameIndex, GraphDefinitionEpoch, GraphId, Input, Node, NodeCacheConfig, NodeId,
+    CachePolicy, FrameIndex, GraphDefinitionEpoch, GraphId, Input, KernelId, Node, NodeCacheConfig,
+    NodeId,
 };
 pub use snapshot::{EvaluationSnapshot, SnapshotId};
 
 pub use eval::{CacheStats, EvalStats, EvaluationScope, Evaluator};
-pub use request::{EvaluationResults, FrameRequests, RequestBatch, RequestBatchId, RequestId};
+pub use request::{
+    EvaluationResults, FrameRequests, RequestBatch, RequestBatchId, RequestId, RequestTicket,
+};
 
 pub use value::SharedValue;
 

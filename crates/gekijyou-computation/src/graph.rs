@@ -1,6 +1,6 @@
 use super::{
     error::GraphError,
-    inputs::ComputationInputs,
+    inputs::{BatchInputNodes, BatchInputs, BatchKernel, ComputationInputs},
     node::{
         Dependency, FrameIndex, GraphDefinitionEpoch, GraphId, Input, Node, NodeId, NodeKind,
         NodeRecord, next_id,
@@ -334,6 +334,7 @@ impl GraphEdit {
             Arc::make_mut(&mut self.graph).insert(NodeKind::Computation {
                 inputs: inputs.into(),
                 computation: computation.into(),
+                batch: None,
             }),
         )
     }
@@ -346,6 +347,7 @@ impl GraphEdit {
                 assert!(args.is_empty());
                 value.clone()
             }),
+            batch: None,
         })
     }
     /// Dependency validity is checked now; whole-transaction acyclicity at commit.
@@ -375,6 +377,122 @@ impl GraphEdit {
         record.kind = NodeKind::Computation {
             inputs: inputs.into(),
             computation: computation.into(),
+            batch: None,
+        };
+        record.revision = revision;
+        self.definition_changed = true;
+        Ok(())
+    }
+    /// Homogeneous slice mapping: one dependency per node, preserving order.
+    /// An empty slice yields a valid frame-independent zero-input node.
+    pub fn map_slice<T, F, O>(&mut self, inputs: &[Node<T>], f: F) -> Result<Node<O>, GraphError>
+    where
+        T: 'static,
+        F: Fn(&[&T]) -> O + Send + Sync + 'static,
+        O: Send + Sync + 'static,
+    {
+        let definition = super::inputs::ComputationDefinition::from_slice(inputs, f);
+        let (inputs, computation) = definition.into_parts();
+        self.graph.check_inputs(&inputs)?;
+        self.definition_changed = true;
+        Ok(
+            Arc::make_mut(&mut self.graph).insert(NodeKind::Computation {
+                inputs: inputs.into(),
+                computation: computation.into(),
+                batch: None,
+            }),
+        )
+    }
+    /// Dependency validity is checked now; whole-transaction acyclicity at commit.
+    pub fn replace_slice<T, F, O>(
+        &mut self,
+        node: Node<O>,
+        inputs: &[Node<T>],
+        f: F,
+    ) -> Result<(), GraphError>
+    where
+        T: 'static,
+        F: Fn(&[&T]) -> O + Send + Sync + 'static,
+        O: Send + Sync + 'static,
+    {
+        self.graph.check(node)?;
+        let record = self.graph.node_record(node.id)?;
+        if !matches!(record.kind, NodeKind::Computation { .. }) {
+            return Err(GraphError::NotComputation { node: node.id });
+        }
+        let revision = record
+            .revision
+            .checked_add(1)
+            .ok_or(GraphError::RevisionExhausted { node: node.id })?;
+        let (inputs, computation) =
+            super::inputs::ComputationDefinition::from_slice(inputs, f).into_parts();
+        self.graph.check_inputs(&inputs)?;
+        let record = Arc::make_mut(
+            Arc::make_mut(&mut self.graph)
+                .nodes
+                .get_mut(&node.id)
+                .unwrap(),
+        );
+        record.kind = NodeKind::Computation {
+            inputs: inputs.into(),
+            computation: computation.into(),
+            batch: None,
+        };
+        record.revision = revision;
+        self.definition_changed = true;
+        Ok(())
+    }
+    /// Compiles a vectorized closure into a reusable [`BatchKernel`].
+    pub fn batch_kernel<P, I: BatchInputs<P, F, O>, F, O>(&self, f: F) -> BatchKernel<P, I, O> {
+        BatchKernel::new(f)
+    }
+    /// Inserts one batch-backed computation node for the given parameter and inputs.
+    pub fn map_batch<P, I: BatchInputNodes<P, O>, O: 'static>(
+        &mut self,
+        kernel: &BatchKernel<P, I, O>,
+        param: P,
+        inputs: I,
+    ) -> Result<Node<O>, GraphError> {
+        let (inputs, computation, batch) = inputs.build_batch_node(kernel, param).into_parts();
+        self.graph.check_inputs(&inputs)?;
+        self.definition_changed = true;
+        Ok(
+            Arc::make_mut(&mut self.graph).insert(NodeKind::Computation {
+                inputs: inputs.into(),
+                computation,
+                batch: Some(batch),
+            }),
+        )
+    }
+    /// Dependency validity is checked now; whole-transaction acyclicity at commit.
+    pub fn replace_batch<P, I: BatchInputNodes<P, O>, O: 'static>(
+        &mut self,
+        node: Node<O>,
+        kernel: &BatchKernel<P, I, O>,
+        param: P,
+        inputs: I,
+    ) -> Result<(), GraphError> {
+        self.graph.check(node)?;
+        let record = self.graph.node_record(node.id)?;
+        if !matches!(record.kind, NodeKind::Computation { .. }) {
+            return Err(GraphError::NotComputation { node: node.id });
+        }
+        let revision = record
+            .revision
+            .checked_add(1)
+            .ok_or(GraphError::RevisionExhausted { node: node.id })?;
+        let (inputs, computation, batch) = inputs.build_batch_node(kernel, param).into_parts();
+        self.graph.check_inputs(&inputs)?;
+        let record = Arc::make_mut(
+            Arc::make_mut(&mut self.graph)
+                .nodes
+                .get_mut(&node.id)
+                .unwrap(),
+        );
+        record.kind = NodeKind::Computation {
+            inputs: inputs.into(),
+            computation,
+            batch: Some(batch),
         };
         record.revision = revision;
         self.definition_changed = true;

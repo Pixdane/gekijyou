@@ -1,5 +1,5 @@
 use gekijyou_computation::{
-    CachePolicy, EvalError, Evaluator, FrameIndex, GraphError, GraphState, NodeCacheConfig,
+    CachePolicy, EvalError, Evaluator, FrameIndex, GraphError, GraphState, Node, NodeCacheConfig,
     PlannerConfig, RequestBatch, SerialExecutor,
 };
 use std::sync::{
@@ -729,4 +729,166 @@ fn zero_dispatch_deferred_misses_count_toward_the_ready_budget() {
         1
     );
     let _ = (id_a, id_b);
+}
+
+#[test]
+fn batch_kernel_coalesces_ready_tasks_and_reuses_caches() {
+    let batch_invocations = Arc::new(AtomicUsize::new(0));
+    let items_processed = Arc::new(AtomicUsize::new(0));
+    let mut state = GraphState::new();
+    let frames = [0_u64, 1, 2, 3];
+    let (kernel, frame, nodes) = state
+        .edit(|e| {
+            let invocations = batch_invocations.clone();
+            let items = items_processed.clone();
+            let kernel = e.batch_kernel::<u64, Node<FrameIndex>, _, u64>(
+                move |input: &[(&u64, &FrameIndex)], out: &mut Vec<u64>| {
+                    invocations.fetch_add(1, Ordering::Relaxed);
+                    for &(param, frame) in input {
+                        items.fetch_add(1, Ordering::Relaxed);
+                        out.push(*param * 10 + frame.0);
+                    }
+                },
+            );
+            let frame = e.frame();
+            let nodes: Vec<_> = (0..3)
+                .map(|actor| e.map_batch(&kernel, actor as u64, frame))
+                .collect::<Result<_, GraphError>>()?;
+            Ok((kernel, frame, nodes))
+        })
+        .unwrap();
+    let mut eval = Evaluator::new(&state);
+    for &node in &nodes {
+        eval.configure_cache(
+            node,
+            NodeCacheConfig {
+                // Retain every distinct frame input so the repeat below is fully served.
+                memo: CachePolicy::Lru {
+                    capacity: frames.len(),
+                },
+                context: CachePolicy::Lru {
+                    capacity: frames.len(),
+                },
+            },
+        )
+        .unwrap();
+    }
+
+    // All actor tasks are ready at once in a single window and coalesce into one
+    // vectorized kernel invocation while each task keeps its own completion.
+    let mut batch = RequestBatch::new();
+    let mut ids = Vec::new();
+    for &f in &frames {
+        for &node in &nodes {
+            ids.push(batch.at(FrameIndex(f)).request(node));
+        }
+    }
+    let (results, stats) = eval
+        .bind(state.snapshot())
+        .unwrap()
+        .evaluate_planned(batch, PlannerConfig::default(), &mut SerialExecutor)
+        .unwrap();
+    assert_eq!(stats.windows, 1);
+    assert_eq!(batch_invocations.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        items_processed.load(Ordering::Relaxed),
+        nodes.len() * frames.len()
+    );
+    assert_eq!(
+        eval.stats().computation_calls,
+        (nodes.len() * frames.len()) as u64
+    );
+    let mut index = 0;
+    for &f in &frames {
+        for (actor, _) in nodes.iter().enumerate() {
+            assert_eq!(*results.get(ids[index]).unwrap(), actor as u64 * 10 + f);
+            index += 1;
+        }
+    }
+
+    // A repeated request is served from the memo/context caches: no new work.
+    let mut repeated = RequestBatch::new();
+    for &f in &frames {
+        for &node in &nodes {
+            repeated.at(FrameIndex(f)).request(node);
+        }
+    }
+    let (_again, stats) = eval
+        .bind(state.snapshot())
+        .unwrap()
+        .evaluate_planned(repeated, PlannerConfig::default(), &mut SerialExecutor)
+        .unwrap();
+    assert_eq!(stats.compute_tasks, 0);
+    assert_eq!(batch_invocations.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        items_processed.load(Ordering::Relaxed),
+        nodes.len() * frames.len()
+    );
+    assert_eq!(
+        eval.stats().computation_calls,
+        (nodes.len() * frames.len()) as u64
+    );
+    assert!(eval.stats().context_hits + eval.stats().memo_hits > 0);
+
+    // Replacing a batch node only changes its parameter.
+    state
+        .edit(|e| e.replace_batch(nodes[0], &kernel, 99_u64, frame))
+        .unwrap();
+    let mut fresh = Evaluator::new(&state);
+    assert_eq!(
+        *fresh
+            .bind(state.snapshot())
+            .unwrap()
+            .sample(FrameIndex(0), nodes[0])
+            .unwrap(),
+        990
+    );
+}
+
+#[test]
+fn batch_kernel_worker_panic_surfaces_and_evaluator_stays_usable() {
+    let mut state = GraphState::new();
+    let (nodes, safe) = state
+        .edit(|e| {
+            let kernel = e.batch_kernel::<u64, Node<FrameIndex>, _, u64>(
+                |input: &[(&u64, &FrameIndex)], out: &mut Vec<u64>| {
+                    for &(param, _frame) in input {
+                        assert!(*param != 0, "batch kernel panic");
+                        out.push(*param);
+                    }
+                },
+            );
+            let frame = e.frame();
+            let nodes: Vec<_> = (0..3)
+                .map(|actor| e.map_batch(&kernel, actor as u64, frame))
+                .collect::<Result<_, GraphError>>()?;
+            let safe = e.constant(7_u64);
+            Ok((nodes, safe))
+        })
+        .unwrap();
+    let mut eval = Evaluator::new(&state);
+    for &node in &nodes {
+        eval.configure_cache(node, off()).unwrap();
+    }
+    let mut batch = RequestBatch::new();
+    for &node in &nodes {
+        batch.at(FrameIndex(0)).request(node);
+    }
+    let outcome = eval.bind(state.snapshot()).unwrap().evaluate_planned(
+        batch,
+        PlannerConfig::default(),
+        &mut SerialExecutor,
+    );
+    // A panic inside the shared kernel is a terminal worker notification.
+    assert!(matches!(outcome, Err(EvalError::WorkerPanicked)));
+    assert!(eval.stats().computation_calls >= 1);
+    // The evaluator is not poisoned by the terminal worker failure.
+    assert_eq!(
+        *eval
+            .bind(state.snapshot())
+            .unwrap()
+            .sample(FrameIndex(0), safe)
+            .unwrap(),
+        7
+    );
 }

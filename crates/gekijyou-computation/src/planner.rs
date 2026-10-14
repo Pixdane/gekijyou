@@ -1,8 +1,8 @@
 use super::{
     EvalError, EvaluationResults, EvaluationScope, EvaluationSnapshot, Evaluator, FrameIndex,
     NodeId, RequestBatch, SharedValue,
-    node::{GraphDefinitionEpoch, NodeKind, next_id},
-    value::ErasedComputation,
+    node::{GraphDefinitionEpoch, KernelId, NodeKind, next_id},
+    value::{BatchKernelRecord, ErasedComputation},
 };
 use crate::collections::{Map as HashMap, Set as HashSet};
 use std::{
@@ -68,6 +68,7 @@ pub struct ComputeTask {
     node: NodeId,
     snapshot: EvaluationSnapshot,
     computation: Arc<ErasedComputation>,
+    batch: Option<BatchKernelRecord>,
     inputs: Box<[SharedValue]>,
 }
 impl ComputeTask {
@@ -82,6 +83,10 @@ impl ComputeTask {
     }
     pub fn definition_epoch(&self) -> GraphDefinitionEpoch {
         self.snapshot.definition_epoch()
+    }
+    /// Reusable batch kernel identity, when this task was built from `map_batch`.
+    pub fn kernel_id(&self) -> Option<KernelId> {
+        self.batch.as_ref().map(|batch| batch.id)
     }
     /// Worker panic is a terminal failure notification, never a cached graph value.
     pub fn execute(self) -> ComputeCompletion {
@@ -103,6 +108,119 @@ impl ComputeTask {
         }))
         .unwrap_or(Err(EvalError::WorkerPanicked));
         ComputeCompletion { id, plan, result }
+    }
+    /// Executes a ready wave, coalescing tasks that share a batch kernel and
+    /// snapshot into single vectorized invocations. Every task still produces
+    /// exactly one completion in input order, including worker panic.
+    pub fn execute_batch(tasks: Vec<ComputeTask>) -> Vec<ComputeCompletion> {
+        if tasks.len() <= 1 || !tasks.iter().any(|task| task.batch.is_some()) {
+            return tasks.into_iter().map(ComputeTask::execute).collect();
+        }
+        let mut completions: Vec<Option<ComputeCompletion>> =
+            (0..tasks.len()).map(|_| None).collect();
+        let mut groups: Vec<(
+            (PlanId, super::SnapshotId, KernelId),
+            Vec<(usize, ComputeTask)>,
+        )> = Vec::new();
+        for (index, task) in tasks.into_iter().enumerate() {
+            let key = task
+                .batch
+                .as_ref()
+                .map(|batch| (task.plan, task.snapshot.id(), batch.id));
+            match key {
+                Some(key) => match groups.iter_mut().find(|(existing, _)| *existing == key) {
+                    Some((_, group)) => group.push((index, task)),
+                    None => groups.push((key, vec![(index, task)])),
+                },
+                None => completions[index] = Some(task.execute()),
+            }
+        }
+        for (_, group) in groups {
+            if group.len() == 1 {
+                for (index, task) in group {
+                    completions[index] = Some(task.execute());
+                }
+                continue;
+            }
+            let meta: smallvec::SmallVec<[(usize, ComputeTaskId, PlanId); 16]> = group
+                .iter()
+                .map(|(index, task)| (*index, task.id, task.plan))
+                .collect();
+            let outcome = catch_unwind(AssertUnwindSafe(move || {
+                let mut arg_storage: smallvec::SmallVec<
+                    [smallvec::SmallVec<[&dyn std::any::Any; 4]>; 16],
+                > = smallvec::SmallVec::with_capacity(group.len());
+                for (_, task) in &group {
+                    arg_storage.push(
+                        task.inputs
+                            .iter()
+                            .map(|value| value.as_ref() as &dyn std::any::Any)
+                            .collect(),
+                    );
+                }
+                let mut call_items: smallvec::SmallVec<
+                    [(&dyn std::any::Any, &[&dyn std::any::Any]); 16],
+                > = smallvec::SmallVec::with_capacity(group.len());
+                for (index, (_, task)) in group.iter().enumerate() {
+                    let batch = task.batch.as_ref().expect("Batch kernel record");
+                    call_items.push((
+                        batch.param.as_ref() as &dyn std::any::Any,
+                        arg_storage[index].as_slice(),
+                    ));
+                }
+                let kernel = group[0]
+                    .1
+                    .batch
+                    .as_ref()
+                    .expect("Batch kernel record")
+                    .kernel
+                    .clone();
+                let outputs = (kernel)(&call_items);
+                assert_eq!(
+                    outputs.len(),
+                    group.len(),
+                    "Batch kernel output count mismatch"
+                );
+                for ((_, task), output) in group.iter().zip(&outputs) {
+                    if output.as_ref().type_id()
+                        != task.snapshot.graph.node_record(task.node)?.type_id
+                    {
+                        return Err(super::GraphError::TypeMismatch { node: task.node }.into());
+                    }
+                }
+                drop(call_items);
+                drop(arg_storage);
+                drop(group);
+                Ok(outputs)
+            }))
+            .unwrap_or(Err(EvalError::WorkerPanicked));
+            match outcome {
+                Ok(outputs) => {
+                    let mut outputs = outputs.into_iter();
+                    for (index, id, plan) in meta {
+                        let output = outputs.next().expect("Batch kernel output count mismatch");
+                        completions[index] = Some(ComputeCompletion {
+                            id,
+                            plan,
+                            result: Ok(output),
+                        });
+                    }
+                }
+                Err(error) => {
+                    for (index, id, plan) in meta {
+                        completions[index] = Some(ComputeCompletion {
+                            id,
+                            plan,
+                            result: Err(error),
+                        });
+                    }
+                }
+            }
+        }
+        completions
+            .into_iter()
+            .map(|completion| completion.expect("Batch execution completion"))
+            .collect()
     }
 }
 /// Opaque completion identities cannot be forged into another plan's cache commit.
@@ -126,7 +244,7 @@ pub trait Executor {
 pub struct SerialExecutor;
 impl Executor for SerialExecutor {
     fn execute(&mut self, tasks: Vec<ComputeTask>) -> Vec<ComputeCompletion> {
-        tasks.into_iter().map(ComputeTask::execute).collect()
+        ComputeTask::execute_batch(tasks)
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -526,8 +644,10 @@ impl EvaluationPlan {
                         .next_task
                         .checked_add(1)
                         .expect("Compute task identity exhausted");
-                    let computation = match &record.kind {
-                        NodeKind::Computation { computation, .. } => computation.clone(),
+                    let (computation, batch) = match &record.kind {
+                        NodeKind::Computation {
+                            computation, batch, ..
+                        } => (computation.clone(), batch.clone()),
                         _ => unreachable!(),
                     };
                     tasks.push(ComputeTask {
@@ -536,6 +656,7 @@ impl EvaluationPlan {
                         node: key.node,
                         snapshot: self.snapshot.clone(),
                         computation,
+                        batch,
                         inputs: inputs.clone(),
                     });
                     window

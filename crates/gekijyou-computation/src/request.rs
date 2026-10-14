@@ -10,7 +10,7 @@ use std::{
     sync::{Arc, atomic::AtomicU64},
 };
 /// Opaque identity shared by one request batch and its completed results.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RequestBatchId(u64);
 impl RequestBatchId {
     fn new() -> Self {
@@ -42,6 +42,20 @@ impl<T> fmt::Debug for RequestId<T> {
             .field("batch", &self.batch)
             .field("index", &self.index)
             .finish()
+    }
+}
+/// Batch-bound untyped result slot ticket obtained from a typed [`RequestId`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RequestTicket {
+    batch: RequestBatchId,
+    index: usize,
+}
+impl<T> RequestId<T> {
+    pub fn ticket(self) -> RequestTicket {
+        RequestTicket {
+            batch: self.batch,
+            index: self.index,
+        }
     }
 }
 pub(crate) struct Request {
@@ -126,33 +140,35 @@ impl EvaluationResults {
     pub fn snapshot_id(&self) -> SnapshotId {
         self.snapshot
     }
-    fn value<T>(&self, request: RequestId<T>) -> Result<&SharedValue, EvalError> {
-        if request.batch != self.batch {
+    fn value_by_ticket(&self, ticket: RequestTicket) -> Result<&SharedValue, EvalError> {
+        if ticket.batch != self.batch {
             return Err(EvalError::ForeignRequest);
         }
         self.outputs
-            .get(request.index)
+            .get(ticket.index)
             .ok_or(EvalError::InvalidRequest {
-                index: request.index,
+                index: ticket.index,
+            })
+    }
+    pub fn get_by_ticket<T: 'static>(&self, ticket: RequestTicket) -> Result<&T, EvalError> {
+        self.value_by_ticket(ticket)?
+            .downcast_ref()
+            .ok_or(EvalError::ResultTypeMismatch {
+                index: ticket.index,
             })
     }
     pub fn get<T: 'static>(&self, request: RequestId<T>) -> Result<&T, EvalError> {
-        self.value(request)?
-            .downcast_ref()
-            .ok_or(EvalError::ResultTypeMismatch {
-                index: request.index,
-            })
+        self.get_by_ticket(request.ticket())
     }
     pub fn get_shared<T: Send + Sync + 'static>(
         &self,
         request: RequestId<T>,
     ) -> Result<Arc<T>, EvalError> {
-        self.value(request)?
+        let index = request.index;
+        self.value_by_ticket(request.ticket())?
             .clone()
             .downcast()
-            .map_err(|_| EvalError::ResultTypeMismatch {
-                index: request.index,
-            })
+            .map_err(|_| EvalError::ResultTypeMismatch { index })
     }
 }
 
@@ -192,5 +208,18 @@ mod tests {
             marker: PhantomData,
         };
         assert_eq!(results.get(foreign), Err(EvalError::ForeignRequest));
+        assert_eq!(results.get_by_ticket::<u64>(wrong_type.ticket()), Ok(&3));
+        assert_eq!(
+            results.get_by_ticket::<u32>(wrong_type.ticket()),
+            Err(EvalError::ResultTypeMismatch { index: 0 })
+        );
+        assert_eq!(
+            results.get_by_ticket::<u64>(invalid.ticket()),
+            Err(EvalError::InvalidRequest { index: 2 })
+        );
+        assert_eq!(
+            results.get_by_ticket::<u64>(foreign.ticket()),
+            Err(EvalError::ForeignRequest)
+        );
     }
 }

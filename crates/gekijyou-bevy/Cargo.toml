@@ -11,6 +11,7 @@ bevy_ecs.workspace = true
 bevy_transform.workspace = true
 bevy_math.workspace = true
 bevy_tasks.workspace = true
+smallvec.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

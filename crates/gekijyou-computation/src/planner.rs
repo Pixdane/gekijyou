@@ -361,6 +361,7 @@ impl EvaluationPlan {
         window: &mut Window,
         key: ResolutionKey,
         value: SharedValue,
+        deferred_ready: usize,
     ) -> Result<(), EvalError> {
         let frame = window.frames.get(&key.frame()).unwrap();
         evaluator.context_insert(&self.snapshot, frame, key.node, value.clone());
@@ -374,12 +375,15 @@ impl EvaluationPlan {
                 window.ready.push_back(child);
             }
         }
-        if window.ready.len() > self.config.max_ready_tasks {
+        if window.ready.len() + deferred_ready > self.config.max_ready_tasks {
             return Err(EvalError::PlannerBudgetExceeded {
                 limit: self.config.max_ready_tasks,
             });
         }
-        self.stats.peak_ready_tasks = self.stats.peak_ready_tasks.max(window.ready.len());
+        self.stats.peak_ready_tasks = self
+            .stats
+            .peak_ready_tasks
+            .max(window.ready.len() + deferred_ready);
         Ok(())
     }
     fn find_compute(
@@ -474,15 +478,13 @@ impl EvaluationPlan {
                 output.clone(),
             );
             for key in waiters {
-                self.deliver(evaluator, &mut window, key, output.clone())?;
+                self.deliver(evaluator, &mut window, key, output.clone(), 0)?;
             }
         }
         loop {
             let mut tasks = Vec::new();
-            while window.running < self.config.max_in_flight && tasks.len() < dispatch_slots {
-                let Some(key) = window.ready.pop_front() else {
-                    break;
-                };
+            let mut deferred: VecDeque<ResolutionKey> = VecDeque::new();
+            while let Some(key) = window.ready.pop_front() {
                 let record = self.snapshot.graph.nodes[&key.node].clone();
                 let inputs: Box<[SharedValue]> = window.resolutions[&key]
                     .dependencies
@@ -492,7 +494,7 @@ impl EvaluationPlan {
                 if let Some(output) =
                     evaluator.memo_lookup(&self.snapshot.graph, key.node, &record, &inputs)?
                 {
-                    self.deliver(evaluator, &mut window, key, output)?;
+                    self.deliver(evaluator, &mut window, key, output, deferred.len())?;
                     continue;
                 }
                 if let Some(id) = self.find_compute(&window, key, &inputs)? {
@@ -500,55 +502,73 @@ impl EvaluationPlan {
                         .identities
                         .insert(IdentityKey::new(key.node, &inputs), id);
                     if let Some(output) = window.computes[&id].output.clone() {
-                        self.deliver(evaluator, &mut window, key, output)?;
+                        self.deliver(evaluator, &mut window, key, output, deferred.len())?;
                     } else {
                         window.resolutions.get_mut(&key).unwrap().waiting = Some(id);
                         window.computes.get_mut(&id).unwrap().waiters.push(key);
                     }
                     continue;
                 }
-                if window.computes.len() >= self.config.max_registry_entries {
-                    return Err(EvalError::PlannerBudgetExceeded {
-                        limit: self.config.max_registry_entries,
-                    });
-                }
-                let id = ComputeTaskId(self.next_task);
-                self.next_task = self
-                    .next_task
-                    .checked_add(1)
-                    .expect("Compute task identity exhausted");
-                let computation = match &record.kind {
-                    NodeKind::Computation { computation, .. } => computation.clone(),
-                    _ => unreachable!(),
-                };
-                tasks.push(ComputeTask {
-                    id,
-                    plan: self.id,
-                    node: key.node,
-                    snapshot: self.snapshot.clone(),
-                    computation,
-                    inputs: inputs.clone(),
-                });
-                window
-                    .identities
-                    .insert(IdentityKey::new(key.node, &inputs), id);
-                window.by_node.entry(key.node).or_default().push(id);
-                window.computes.insert(
-                    id,
-                    ComputeEntry {
+                // Only genuinely new work is gated by dispatch quota. Deferred
+                // misses are retried once per call via completions/hits; a check
+                // flag would wrongly suppress re-queries after commits.
+                if window.running < self.config.max_in_flight && tasks.len() < dispatch_slots {
+                    // Registry capacity is only violated when a task can
+                    // actually be created; quota-less misses defer instead.
+                    if window.computes.len() >= self.config.max_registry_entries {
+                        self.window = Some(window);
+                        return Err(EvalError::PlannerBudgetExceeded {
+                            limit: self.config.max_registry_entries,
+                        });
+                    }
+                    let id = ComputeTaskId(self.next_task);
+                    self.next_task = self
+                        .next_task
+                        .checked_add(1)
+                        .expect("Compute task identity exhausted");
+                    let computation = match &record.kind {
+                        NodeKind::Computation { computation, .. } => computation.clone(),
+                        _ => unreachable!(),
+                    };
+                    tasks.push(ComputeTask {
+                        id,
+                        plan: self.id,
                         node: key.node,
-                        inputs,
-                        waiters: vec![key],
-                        running: true,
-                        output: None,
-                    },
-                );
-                window.resolutions.get_mut(&key).unwrap().waiting = Some(id);
-                window.running += 1;
-                self.stats.compute_tasks += 1;
-                self.stats.peak_registry_entries =
-                    self.stats.peak_registry_entries.max(window.computes.len());
-                self.stats.peak_in_flight = self.stats.peak_in_flight.max(window.running);
+                        snapshot: self.snapshot.clone(),
+                        computation,
+                        inputs: inputs.clone(),
+                    });
+                    window
+                        .identities
+                        .insert(IdentityKey::new(key.node, &inputs), id);
+                    window.by_node.entry(key.node).or_default().push(id);
+                    window.computes.insert(
+                        id,
+                        ComputeEntry {
+                            node: key.node,
+                            inputs,
+                            waiters: vec![key],
+                            running: true,
+                            output: None,
+                        },
+                    );
+                    window.resolutions.get_mut(&key).unwrap().waiting = Some(id);
+                    window.running += 1;
+                    self.stats.compute_tasks += 1;
+                    self.stats.peak_registry_entries =
+                        self.stats.peak_registry_entries.max(window.computes.len());
+                    self.stats.peak_in_flight = self.stats.peak_in_flight.max(window.running);
+                } else {
+                    deferred.push_back(key);
+                }
+            }
+            // Deferred misses stay inside the Ready budget: deliver already
+            // validates window.ready.len() + deferred on every push. Restore
+            // them in encounter order after the drain, before the
+            // window-completion check; no re-drain in this call.
+            if !deferred.is_empty() {
+                window.ready.extend(deferred);
+                self.stats.peak_ready_tasks = self.stats.peak_ready_tasks.max(window.ready.len());
             }
             if !tasks.is_empty() || window.running > 0 || !window.ready.is_empty() {
                 self.window = Some(window);

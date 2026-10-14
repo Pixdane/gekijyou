@@ -52,7 +52,7 @@ impl Executor for BevyExecutor<'_> {
 /// let mut state = GraphState::new();
 /// let node = state.edit(|e| e.map(e.frame(), |f: &FrameIndex| f.0))?;
 /// let mut evaluator = Evaluator::new(&state);
-/// let mut driver = AsyncDriver::new(state.snapshot(), TaskLimits { max_in_flight: 2, max_pending: 4 });
+/// let mut driver = AsyncDriver::new(state.snapshot(), TaskLimits { max_in_flight: 2, max_pending: 4 }, 1);
 /// let pool = TaskPoolBuilder::new().num_threads(2).build();
 /// let mut batch = RequestBatch::new();
 /// let id = batch.at(FrameIndex(20)).request(node);
@@ -71,10 +71,15 @@ pub struct AsyncDriver {
     generation: RequestGeneration,
 }
 impl AsyncDriver {
-    pub fn new(snapshot: EvaluationSnapshot, limits: TaskLimits) -> Self {
+    /// `chunk_size` only groups logical tasks into physical TaskPool jobs;
+    /// quotas, terminals and per-task statistics stay logical. Zero panics
+    /// at construction.
+    pub fn new(snapshot: EvaluationSnapshot, limits: TaskLimits, chunk_size: usize) -> Self {
         let generation = RequestGeneration::new();
         Self {
-            tracker: Mutex::new(TaskCoordinator::new(snapshot, generation, limits)),
+            tracker: Mutex::new(TaskCoordinator::new(
+                snapshot, generation, limits, chunk_size,
+            )),
             plan: None,
             generation,
         }
@@ -176,13 +181,13 @@ impl AsyncDriver {
         if plan.is_complete() {
             return self.plan.take().unwrap().finish().map(Some);
         }
-        self.tracker().dispatch_pending(pool);
-        for task in tasks {
-            // Slots were reserved by the coordinator budget. No other caller can
-            // submit while this exclusive method runs; admission is deterministic.
-            assert!(
-                self.tracker()
-                    .submit_fallible(pool, move |_| {
+        // The batch entry dispatches, including empty batches, so already
+        // queued work drains without a separate dispatch_pending call.
+        assert!(
+            self.tracker()
+                .submit_batch_fallible(
+                    pool,
+                    tasks.into_iter().map(|task| move |_| {
                         let completion = task.execute();
                         if let Some(error) = completion.failure() {
                             Err(error)
@@ -190,10 +195,10 @@ impl AsyncDriver {
                             Ok(completion)
                         }
                     })
-                    .is_some(),
-                "Reserved task admission failed"
-            );
-        }
+                )
+                .is_some(),
+            "Reserved task admission failed"
+        );
         Ok(None)
     }
 }

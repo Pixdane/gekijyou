@@ -674,6 +674,7 @@ dependencies = [
  "bevy_tasks",
  "bevy_transform",
  "gekijyou-computation",
+ "smallvec",
  "thiserror",
 ]
 

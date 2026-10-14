@@ -1,5 +1,6 @@
 use bevy_tasks::TaskPool;
 use gekijyou_computation::{EvalError, EvaluationSnapshot, SnapshotId};
+use smallvec::SmallVec;
 use std::{
     collections::{HashMap, VecDeque},
     panic::{AssertUnwindSafe, catch_unwind},
@@ -49,6 +50,9 @@ pub struct TaskStats {
     pub obsolete: u64,
     pub canceled_pending: u64,
     pub peak_in_flight: usize,
+    /// Physical TaskPool jobs spawned; logical chunks make this smaller than
+    /// `dispatched`. Every successful `pool.spawn` path increments it once.
+    pub worker_jobs_spawned: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Session {
@@ -109,6 +113,7 @@ pub struct TaskCoordinator<R: Send + 'static> {
     snapshot: EvaluationSnapshot,
     generation: RequestGeneration,
     limits: TaskLimits,
+    chunk_size: usize,
     next: u64,
     pending: VecDeque<Queued<R>>,
     running: HashMap<TaskId, Running>,
@@ -117,15 +122,21 @@ pub struct TaskCoordinator<R: Send + 'static> {
     stats: TaskStats,
 }
 impl<R: Send + 'static> TaskCoordinator<R> {
+    /// `chunk_size` only groups logical tasks into physical TaskPool jobs;
+    /// quotas, per-task terminals and statistics stay logical, and
+    /// `worker_jobs_spawned` is not guaranteed smaller than `dispatched`
+    /// (chunk 1 keeps them equal). Zero panics at construction.
     pub fn new(
         snapshot: EvaluationSnapshot,
         generation: RequestGeneration,
         limits: TaskLimits,
+        chunk_size: usize,
     ) -> Self {
         assert!(
             limits.max_in_flight > 0,
             "At least one worker slot is required"
         );
+        assert!(chunk_size > 0, "Chunk size must be positive");
         limits
             .max_in_flight
             .checked_add(limits.max_pending)
@@ -135,6 +146,7 @@ impl<R: Send + 'static> TaskCoordinator<R> {
             snapshot,
             generation,
             limits,
+            chunk_size,
             next: 0,
             pending: VecDeque::new(),
             running: HashMap::new(),
@@ -189,11 +201,51 @@ impl<R: Send + 'static> TaskCoordinator<R> {
         pool: &TaskPool,
         job: impl FnOnce(EvaluationSnapshot) -> Result<R, EvalError> + Send + 'static,
     ) -> Option<TaskId> {
-        if self.running.len() >= self.limits.max_in_flight
-            && self.pending.len() >= self.limits.max_pending
-        {
+        if self.available() == 0 {
             return None;
         }
+        let id = self.enqueue(job);
+        self.dispatch(pool);
+        Some(id)
+    }
+    /// Submits a whole batch as one admission decision. The exact length is
+    /// taken first: any batch that does not fit the total quota is rejected
+    /// whole (None), leaving queue, running, statistics and task identity
+    /// untouched; an exact fit is always accepted. Accepted tasks are queued
+    /// in iteration order and dispatched once, in chunks. An empty batch is
+    /// accepted and still dispatches already-pending work.
+    ///
+    /// The capacity rejection itself is atomic. If the caller's own iterator
+    /// panics while being consumed, an already-accepted prefix can stay queued
+    /// and undispatched; `cancel` cleans that up.
+    pub fn submit_batch_fallible<I, J>(&mut self, pool: &TaskPool, jobs: I) -> Option<Vec<TaskId>>
+    where
+        I: IntoIterator<Item = J>,
+        I::IntoIter: ExactSizeIterator,
+        J: FnOnce(EvaluationSnapshot) -> Result<R, EvalError> + Send + 'static,
+    {
+        let iter = jobs.into_iter();
+        let len = iter.len();
+        if len > self.available() {
+            return None;
+        }
+        // Identity overflow is detected before any admission; nothing is queued.
+        let len = u64::try_from(len).expect("Task identity exhausted");
+        self.next.checked_add(len).expect("Task identity exhausted");
+        let mut ids = Vec::with_capacity(len as usize);
+        for job in iter {
+            let id = self.enqueue(job);
+            ids.push(id);
+        }
+        self.dispatch(pool);
+        Some(ids)
+    }
+    /// Shared enqueue: ID allocation and queue insertion only. Dispatch is
+    /// always the caller's explicit decision; callers validate admission.
+    fn enqueue<J>(&mut self, job: J) -> TaskId
+    where
+        J: FnOnce(EvaluationSnapshot) -> Result<R, EvalError> + Send + 'static,
+    {
         let id = TaskId(self.next);
         self.next = self.next.checked_add(1).expect("Task identity exhausted");
         self.pending.push_back(Queued {
@@ -202,8 +254,7 @@ impl<R: Send + 'static> TaskCoordinator<R> {
             snapshot: self.snapshot.clone(),
             job: Box::new(job),
         });
-        self.dispatch(pool);
-        Some(id)
+        id
     }
     /// Definitions may advance but cannot roll back. Snapshot or generation changes
     /// discard old waiting jobs; running jobs remain counted and retain their Arcs.
@@ -248,32 +299,54 @@ impl<R: Send + 'static> TaskCoordinator<R> {
 
     fn dispatch(&mut self, pool: &TaskPool) {
         while self.running.len() < self.limits.max_in_flight {
-            let Some(queued) = self.pending.pop_front() else {
+            let chunk_len = self
+                .chunk_size
+                .min(self.pending.len())
+                .min(self.limits.max_in_flight - self.running.len());
+            if chunk_len == 0 {
                 break;
-            };
-            let guard = TerminalGuard {
-                sender: self.sender.clone(),
-                completion: Some(Completion {
-                    id: queued.id,
-                    session: queued.session,
-                    result: Err(EvalError::WorkerPanicked),
-                }),
-            };
-            self.running.insert(
-                queued.id,
-                Running {
-                    session: queued.session,
-                    canceled: false,
-                },
-            );
-            self.stats.dispatched += 1;
+            }
+            // One chunk is one physical job. Guards and running tickets are
+            // registered for every logical task before a single spawn.
+            let mut chunk: smallvec::SmallVec<[(Queued<R>, TerminalGuard<R>); 4]> =
+                SmallVec::with_capacity(chunk_len);
+            for _ in 0..chunk_len {
+                let queued = self.pending.pop_front().unwrap();
+                let guard = TerminalGuard {
+                    sender: self.sender.clone(),
+                    completion: Some(Completion {
+                        id: queued.id,
+                        session: queued.session,
+                        result: Err(EvalError::WorkerPanicked),
+                    }),
+                };
+                chunk.push((queued, guard));
+            }
+            for (queued, _) in &chunk {
+                self.running.insert(
+                    queued.id,
+                    Running {
+                        session: queued.session,
+                        canceled: false,
+                    },
+                );
+                self.stats.dispatched += 1;
+            }
             self.stats.peak_in_flight = self.stats.peak_in_flight.max(self.running.len());
+            // `pool.spawn` runs the future on a worker immediately; the borrow
+            // of self ends before the call, so the physical job counter only
+            // increments on the successful spawn path.
             pool.spawn(async move {
-                let result = catch_unwind(AssertUnwindSafe(|| (queued.job)(queued.snapshot)))
-                    .unwrap_or(Err(EvalError::WorkerPanicked));
-                guard.finish(result);
+                // FIFO order inside the chunk; one panicking job never skips
+                // the rest, each task still finishes its own terminal guard.
+                for (queued, guard) in chunk {
+                    let result = catch_unwind(AssertUnwindSafe(|| (queued.job)(queued.snapshot)))
+                        .unwrap_or(Err(EvalError::WorkerPanicked));
+                    guard.finish(result);
+                }
             })
             .detach();
+            self.stats.worker_jobs_spawned += 1;
         }
     }
     /// Reclaims quota before filtering or delivering payloads. Duplicate/late

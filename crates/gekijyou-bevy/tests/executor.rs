@@ -126,6 +126,16 @@ fn definition_edits_and_repeated_replacement_keep_old_worker_quota_until_termina
     let mut world = World::new();
     let entity = world.spawn(Transform::default()).id();
     let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    struct Releaser {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+    impl Drop for Releaser {
+        fn drop(&mut self) {
+            let (lock, ready) = &*self.gate;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+    }
     let (start_tx, start_rx) = mpsc::channel();
     let node = state
         .edit(|e| {
@@ -143,6 +153,9 @@ fn definition_edits_and_repeated_replacement_keep_old_worker_quota_until_termina
         .unwrap();
     let mut eval = Evaluator::new(&state);
     eval.configure_cache(node, off()).unwrap();
+    // Declared after the pool; armed before the first poll that can block a
+    // worker on the gate, so failures never strand the TaskPool join.
+    let _releaser = Releaser { gate: gate.clone() };
     let mut bindings = Bindings::new();
     bindings
         .bind_output(
@@ -152,7 +165,7 @@ fn definition_edits_and_repeated_replacement_keep_old_worker_quota_until_termina
             OutputField::transform_translation(),
         )
         .unwrap();
-    let mut driver = AsyncDriver::new(state.snapshot(), limits());
+    let mut driver = AsyncDriver::new(state.snapshot(), limits(), 1);
     let mut old = bindings
         .request(&state.snapshot(), &[FrameIndex(0)])
         .unwrap();
@@ -220,7 +233,7 @@ fn worker_failure_is_terminal_and_never_delivers_partial_results() {
         .edit(|e| Ok((e.constant(1_u64), e.map((), || -> u64 { panic!("async") })?)))
         .unwrap();
     let mut eval = Evaluator::new(&state);
-    let mut driver = AsyncDriver::new(state.snapshot(), limits());
+    let mut driver = AsyncDriver::new(state.snapshot(), limits(), 1);
     let mut batch = RequestBatch::new();
     batch.at(FrameIndex(0)).request(good);
     batch.at(FrameIndex(0)).request(bad);
@@ -258,7 +271,7 @@ fn same_snapshot_requests_have_distinct_identities_and_old_cancel_tokens_are_har
     let node = state.edit(|e| Ok(e.constant(3_u64))).unwrap();
     let snapshot = state.snapshot();
     let mut eval = Evaluator::new(&state);
-    let mut driver = AsyncDriver::new(snapshot.clone(), limits());
+    let mut driver = AsyncDriver::new(snapshot.clone(), limits(), 1);
     let mut old = RequestBatch::new();
     old.at(FrameIndex(0)).request(node);
     let generation = driver
@@ -295,7 +308,7 @@ fn cancellation_is_explicit_and_preserves_existing_evaluator_history() {
             .unwrap(),
         100
     );
-    let mut driver = AsyncDriver::new(snapshot.clone(), limits());
+    let mut driver = AsyncDriver::new(snapshot.clone(), limits(), 1);
     let mut batch = RequestBatch::new();
     batch.at(FrameIndex(20)).request(node);
     let generation = driver
@@ -323,7 +336,7 @@ fn invalid_replacement_does_not_cancel_a_valid_request() {
     let mut state = GraphState::new();
     let node = state.edit(|e| Ok(e.constant(8_u64))).unwrap();
     let mut eval = Evaluator::new(&state);
-    let mut driver = AsyncDriver::new(state.snapshot(), limits());
+    let mut driver = AsyncDriver::new(state.snapshot(), limits(), 1);
     let mut batch = RequestBatch::new();
     let id = batch.at(FrameIndex(20)).request(node);
     let generation = driver
@@ -396,6 +409,19 @@ fn obsolete_payload_drop_panic_terminates_active_request_and_allows_retry() {
     }
     let pool = TaskPoolBuilder::new().num_threads(1).build();
     let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    struct Releaser {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+    impl Drop for Releaser {
+        fn drop(&mut self) {
+            let (lock, ready) = &*self.gate;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+    }
+    // Declared after the pool, armed before the first poll that can strand a
+    // worker on the gate.
+    let _releaser = Releaser { gate: gate.clone() };
     let flag = Arc::new(AtomicBool::new(true));
     let (started_tx, started_rx) = mpsc::channel();
     let mut state = GraphState::new();
@@ -416,7 +442,7 @@ fn obsolete_payload_drop_panic_terminates_active_request_and_allows_retry() {
         })
         .unwrap();
     let mut eval = Evaluator::new(&state);
-    let mut driver = AsyncDriver::new(state.snapshot(), limits());
+    let mut driver = AsyncDriver::new(state.snapshot(), limits(), 1);
     let mut batch = RequestBatch::new();
     batch.at(FrameIndex(0)).request(old);
     let old_generation = driver
@@ -499,7 +525,7 @@ fn async_completed_selection_can_be_held_and_applied_repeatedly() {
         )
         .unwrap();
     let mut eval = Evaluator::new(&state);
-    let mut driver = AsyncDriver::new(snapshot.clone(), limits());
+    let mut driver = AsyncDriver::new(snapshot.clone(), limits(), 1);
     driver
         .begin(
             &mut eval,
@@ -565,6 +591,7 @@ fn cache_commit_panic_reclaims_worker_quota_and_allows_a_fresh_request() {
             max_in_flight: 1,
             max_pending: 0,
         },
+        1,
     );
     let mut batch = RequestBatch::new();
     batch.at(FrameIndex(1)).request(node);
@@ -661,4 +688,758 @@ fn explicit_serial_and_parallel_planner_results_apply_to_ecs() {
             assert_eq!(transform.rotation, Quat::from_rotation_z(0.5));
         }
     }
+}
+
+#[test]
+fn gated_old_worker_does_not_block_fresh_cached_chain_delivery() {
+    struct Releaser {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+    impl Drop for Releaser {
+        fn drop(&mut self) {
+            let (lock, ready) = &*self.gate;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+    }
+    let pool = TaskPoolBuilder::new().num_threads(2).build();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    // Declared after the pool so reverse drop opens the gate before join.
+    let _releaser = Releaser { gate: gate.clone() };
+    let (started_tx, started_rx) = mpsc::channel();
+    let mut state = GraphState::new();
+    let (gated, chain_nodes) = state
+        .edit(|e| {
+            let gate = gate.clone();
+            let gated = e.map((), move || {
+                started_tx.send(()).unwrap();
+                let (lock, ready) = &*gate;
+                let mut open = lock.lock().unwrap();
+                while !*open {
+                    open = ready.wait(open).unwrap();
+                }
+                0_u64
+            })?;
+            let ten = e.constant(10_u64);
+            let plus = e.map(ten, |x: &u64| x + 1)?;
+            let times = e.map(plus, |x: &u64| x * 2)?;
+            Ok((gated, (ten, plus, times)))
+        })
+        .unwrap();
+    let (ten, plus, times) = chain_nodes;
+    let mut eval = Evaluator::new(&state);
+    eval.configure_cache(gated, off()).unwrap();
+    let chain_warm = NodeCacheConfig {
+        memo: CachePolicy::Last,
+        context: CachePolicy::Off,
+    };
+    for node in [ten, plus, times] {
+        eval.configure_cache(node, chain_warm).unwrap();
+    }
+    // Warm the chain once on the same evaluator.
+    {
+        let mut warm_batch = RequestBatch::new();
+        warm_batch.at(FrameIndex(0)).request(times);
+        let mut plan = eval
+            .plan(state.snapshot(), warm_batch, PlannerConfig::default())
+            .unwrap();
+        let mut completed = Vec::new();
+        while !plan.is_complete() {
+            let tasks = eval.advance(&mut plan, completed).unwrap();
+            completed = tasks.into_iter().map(|t| t.execute()).collect();
+        }
+        plan.finish().unwrap();
+    }
+    assert_eq!(eval.cache_stats().memo_entries, 3);
+    let snapshot = state.snapshot();
+    let mut driver = AsyncDriver::new(
+        snapshot.clone(),
+        TaskLimits {
+            max_in_flight: 1,
+            max_pending: 0,
+        },
+        1,
+    );
+    let mut old_batch = RequestBatch::new();
+    old_batch.at(FrameIndex(0)).request(gated);
+    let old_generation = driver
+        .begin(
+            &mut eval,
+            snapshot.clone(),
+            old_batch,
+            PlannerConfig::default(),
+        )
+        .unwrap();
+    // The gated node claims the single in-flight slot.
+    assert!(driver.poll(&mut eval, &pool).unwrap().is_none());
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    // Replace with a batch requesting only the cached chain tail.
+    let mut new_batch = RequestBatch::new();
+    let tail_id = new_batch.at(FrameIndex(42)).request(times);
+    let new_generation = driver
+        .begin(
+            &mut eval,
+            snapshot.clone(),
+            new_batch,
+            PlannerConfig::default(),
+        )
+        .unwrap();
+    assert_ne!(old_generation, new_generation);
+    // While the gate stays closed the cached chain still delivers.
+    let results = complete(&mut driver, &mut eval, &pool);
+    assert_eq!(results.get(tail_id).unwrap(), &22);
+    assert_eq!(driver.in_flight(), 1);
+    let stats = driver.stats();
+    assert_eq!(stats.dispatched, 1);
+    // Release the gate and reclaim the old worker.
+    {
+        let (lock, ready) = &*gate;
+        *lock.lock().unwrap() = true;
+        ready.notify_all();
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while driver.in_flight() > 0 {
+        assert!(driver.poll(&mut eval, &pool).unwrap().is_none());
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let stats = driver.stats();
+    assert_eq!(stats.dispatched, 1);
+    assert_eq!(stats.terminal, 1);
+    assert_eq!(stats.obsolete, 1);
+}
+fn async_chunk_oracle(layers: u64, frame: u64) -> u64 {
+    let mut x = frame;
+    for k in 1..=layers {
+        x = x.wrapping_add(k).rotate_left(3);
+    }
+    x
+}
+
+#[test]
+fn async_chunks_cover_multi_layer_graph_across_repeated_frames() {
+    let pool = TaskPoolBuilder::new().num_threads(4).build();
+    let mut state = GraphState::new();
+    let tail = state
+        .edit(|e| {
+            let frame = e.frame();
+            let mut current = e.map(frame, |f: &FrameIndex| f.0)?;
+            for k in 1..=64u64 {
+                current = e.map(current, move |x: &u64| x.wrapping_add(k).rotate_left(3))?;
+            }
+            Ok(current)
+        })
+        .unwrap();
+    let snapshot = state.snapshot();
+    // Frames are generated once; DFS runs one batch through one evaluator and
+    // its per-frame results are the cross-check the chunk matrix compares to.
+    let frames: Vec<u64> = (0..24).map(|i| (((i * 17) % 12) * 7) as u64).collect();
+    let dfs_expected: Vec<u64> = {
+        let mut dfs_eval = Evaluator::new(&state);
+        let mut batch = RequestBatch::new();
+        let ids: Vec<_> = frames
+            .iter()
+            .map(|&f| batch.at(FrameIndex(f)).request(tail))
+            .collect();
+        let results = dfs_eval
+            .bind(snapshot.clone())
+            .unwrap()
+            .evaluate(batch)
+            .unwrap();
+        ids.into_iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let dfs_value = *results.get(id).unwrap();
+                assert_eq!(
+                    dfs_value,
+                    async_chunk_oracle(64, frames[i]),
+                    "DFS frame {} must match the oracle",
+                    frames[i]
+                );
+                dfs_value
+            })
+            .collect()
+    };
+    for chunk in [1usize, 4, 16] {
+        let mut eval = Evaluator::new(&state);
+        let mut driver = AsyncDriver::new(
+            snapshot.clone(),
+            TaskLimits {
+                max_in_flight: 64,
+                max_pending: 64,
+            },
+            chunk,
+        );
+        // Repeated and out-of-order frames exercise window reuse per chunk.
+        let mut batch = RequestBatch::new();
+        let mut expectations = Vec::new();
+        for &f in &frames {
+            expectations.push((f, batch.at(FrameIndex(f)).request(tail)));
+        }
+        driver
+            .begin(
+                &mut eval,
+                snapshot.clone(),
+                batch,
+                PlannerConfig {
+                    max_in_flight: 64,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let (results, _) = loop {
+            match driver.poll(&mut eval, &pool).unwrap() {
+                Some(done) => break done,
+                None => std::thread::yield_now(),
+            }
+        };
+        for ((f, id), dfs_value) in expectations.into_iter().zip(&dfs_expected) {
+            let planner_value = *results.get(id).unwrap();
+            assert_eq!(
+                planner_value, *dfs_value,
+                "chunk {chunk} frame {f}: planner vs DFS"
+            );
+            assert_eq!(
+                planner_value,
+                async_chunk_oracle(64, f),
+                "chunk {chunk} frame {f}: oracle"
+            );
+        }
+    }
+}
+
+#[test]
+fn chunk_member_failure_reclaims_all_quota_and_allows_a_new_request() {
+    let pool = TaskPoolBuilder::new().num_threads(4).build();
+    let mut state = GraphState::new();
+    let node = state
+        .edit(|e| {
+            // One frame-dependent node: frame 1 panics, every other frame is a
+            // plain +1. Ready order sorts by node then frame, so frame 1 is
+            // the SECOND member of the four-frame chunk.
+            e.map(e.frame(), |f: &FrameIndex| -> u64 {
+                if f.0 == 1 {
+                    panic!("chunk failure");
+                }
+                f.0 + 1
+            })
+        })
+        .unwrap();
+    let snapshot = state.snapshot();
+    let mut eval = Evaluator::new(&state);
+    eval.configure_cache(node, off()).unwrap();
+    let mut driver = AsyncDriver::new(
+        snapshot.clone(),
+        TaskLimits {
+            max_in_flight: 64,
+            max_pending: 64,
+        },
+        4,
+    );
+    let mut batch = RequestBatch::new();
+    let mut ids = Vec::new();
+    for f in 0..4_u64 {
+        ids.push((f, batch.at(FrameIndex(f)).request(node)));
+    }
+    driver
+        .begin(&mut eval, snapshot.clone(), batch, PlannerConfig::default())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match driver.poll(&mut eval, &pool) {
+            Err(EvalError::WorkerPanicked) => break,
+            Ok(None) => (),
+            Ok(Some(_)) => panic!("failed request must not deliver results"),
+            Err(error) => panic!("unexpected error {error}"),
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    // The failing chunk's remaining members hold quota until their own
+    // terminals arrive; drain completely before asserting totals. One poll
+    // is not required to reclaim every not-yet-arrived completion.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while driver.in_flight() > 0 {
+        assert!(driver.poll(&mut eval, &pool).unwrap().is_none());
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let stats = driver.stats();
+    assert_eq!(stats.failed, 1);
+    assert_eq!(stats.dispatched, 4);
+    assert_eq!(stats.terminal, 4);
+    // A fresh request on the same driver/evaluator succeeds.
+    let mut batch = RequestBatch::new();
+    let id = batch.at(FrameIndex(5)).request(node);
+    driver
+        .begin(&mut eval, snapshot.clone(), batch, PlannerConfig::default())
+        .unwrap();
+    let results = complete(&mut driver, &mut eval, &pool);
+    assert_eq!(*results.get(id).unwrap(), 6);
+}
+
+#[test]
+fn canceled_full_chunk_does_not_pollute_new_definition_results() {
+    let pool = TaskPoolBuilder::new().num_threads(4).build();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    struct Releaser {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+    impl Drop for Releaser {
+        fn drop(&mut self) {
+            let (lock, ready) = &*self.gate;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+    }
+    let (started_tx, started_rx) = mpsc::channel();
+    let mut state = GraphState::new();
+    let node = state
+        .edit(|e| {
+            let gate = gate.clone();
+            e.map(e.frame(), move |f: &FrameIndex| {
+                // All four logical members are dispatched and running; the
+                // first blocks the gate inside the one physical job, so the
+                // remaining three have not yet executed their closures.
+                let (lock, ready) = &*gate;
+                let mut open = lock.lock().unwrap();
+                if f.0 == 0 {
+                    let _ = started_tx.send(());
+                    while !*open {
+                        open = ready.wait(open).unwrap();
+                    }
+                }
+                1_u64
+            })
+        })
+        .unwrap();
+    let mut eval = Evaluator::new(&state);
+    eval.configure_cache(node, off()).unwrap();
+    // Declared after the pool, armed before the first fallible wait.
+    let _releaser = Releaser { gate: gate.clone() };
+    let snapshot = state.snapshot();
+    let mut driver = AsyncDriver::new(
+        snapshot.clone(),
+        TaskLimits {
+            max_in_flight: 64,
+            max_pending: 64,
+        },
+        4,
+    );
+    let mut batch = RequestBatch::new();
+    // Exactly one window of four frames: the planner emits four logical tasks
+    // which the coordinator admits as one full chunk (one physical job).
+    for f in 0..4 {
+        batch.at(FrameIndex(f)).request(node);
+    }
+    let old_generation = driver
+        .begin(&mut eval, snapshot.clone(), batch, PlannerConfig::default())
+        .unwrap();
+    assert!(driver.poll(&mut eval, &pool).unwrap().is_none());
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    // Four logical members dispatched, first member confirmed inside the gate.
+    assert_eq!(driver.in_flight(), 4);
+    // Definition switch while the full chunk runs.
+    state.edit(|e| e.replace(node, (), || 42_u64)).unwrap();
+    let new_snapshot = state.snapshot();
+    let mut batch = RequestBatch::new();
+    let id = batch.at(FrameIndex(0)).request(node);
+    driver
+        .begin(
+            &mut eval,
+            new_snapshot.clone(),
+            batch,
+            PlannerConfig::default(),
+        )
+        .unwrap();
+    assert_ne!(old_generation, driver.generation());
+    // The old generation token is dead after the replacement; cancel must
+    // refuse it (the successor owns the session now).
+    assert!(!driver.cancel(old_generation));
+    // The new definition result must be the new value, never polluted by the
+    // canceled chunk (the replaced plan's ready keys are dropped by cancel).
+    let results = complete(&mut driver, &mut eval, &pool);
+    assert_eq!(*results.get(id).unwrap(), 42);
+    assert_eq!(results.snapshot_id(), new_snapshot.id());
+    // Release the gate: all four obsolete logical members keep their quota
+    // until their natural terminal messages, then release exactly once each.
+    {
+        let (lock, ready) = &*gate;
+        *lock.lock().unwrap() = true;
+        ready.notify_all();
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while driver.in_flight() > 0 {
+        assert!(driver.poll(&mut eval, &pool).unwrap().is_none());
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let stats = driver.stats();
+    assert_eq!(stats.obsolete, 4);
+    // One obsolete old chunk (4 logical) + one terminal from the new request.
+    assert_eq!(stats.terminal, 5);
+}
+#[test]
+fn chunk4_obsolete_payload_drop_panic_keeps_residue_and_allows_replacement() {
+    use std::sync::atomic::AtomicBool;
+    struct Releaser {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+    impl Drop for Releaser {
+        fn drop(&mut self) {
+            let (lock, ready) = &*self.gate;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+    }
+    let pool = TaskPoolBuilder::new().num_threads(4).build();
+    // Two independent gate positions: frame 0 blocks on gate 1, frame 1
+    // (running behind it in the same physical job) blocks on gate 2.
+    let gate1 = Arc::new((Mutex::new(false), Condvar::new()));
+    let gate2 = Arc::new((Mutex::new(false), Condvar::new()));
+    // Declared after the pool; both armed before the first fallible wait.
+    let _releaser1 = Releaser {
+        gate: gate1.clone(),
+    };
+    let _releaser2 = Releaser {
+        gate: gate2.clone(),
+    };
+    // Armed exactly once: the frame-0 obsolete payload destructor panics.
+    let flag = Arc::new(AtomicBool::new(true));
+    // The replacement definition produces Payloads guarded by a fresh,
+    // never-armed flag so reclaimed successors never panic on drop.
+    let safe_flag = Arc::new(AtomicBool::new(false));
+    let (started_tx, started_rx) = mpsc::channel();
+    struct Payload {
+        value: u64,
+        destructor: Arc<AtomicBool>,
+    }
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            assert!(
+                !self.destructor.swap(false, Ordering::Relaxed),
+                "obsolete payload destructor"
+            );
+        }
+    }
+    let mut state = GraphState::new();
+    let node = state
+        .edit(|e| {
+            let gate1 = gate1.clone();
+            let gate2 = gate2.clone();
+            let flag = flag.clone();
+            e.map(e.frame(), move |f: &FrameIndex| {
+                let wait = |gate: &Arc<(Mutex<bool>, Condvar)>| {
+                    let (lock, ready) = &**gate;
+                    let mut open = lock.lock().unwrap();
+                    while !*open {
+                        open = ready.wait(open).unwrap();
+                    }
+                };
+                match f.0 {
+                    0 => {
+                        let _ = started_tx.send(());
+                        wait(&gate1);
+                        Payload {
+                            value: f.0,
+                            destructor: flag.clone(),
+                        }
+                    }
+                    1 => {
+                        let _ = started_tx.send(());
+                        wait(&gate2);
+                        Payload {
+                            value: f.0,
+                            destructor: flag.clone(),
+                        }
+                    }
+                    _ => Payload {
+                        value: f.0,
+                        destructor: flag.clone(),
+                    },
+                }
+            })
+        })
+        .unwrap();
+    let mut eval = Evaluator::new(&state);
+    eval.configure_cache(node, off()).unwrap();
+    let snapshot = state.snapshot();
+    let mut driver = AsyncDriver::new(
+        snapshot.clone(),
+        TaskLimits {
+            max_in_flight: 4,
+            max_pending: 4,
+        },
+        4,
+    );
+    let mut batch = RequestBatch::new();
+    for f in 0..4 {
+        batch.at(FrameIndex(f)).request(node);
+    }
+    let old_generation = driver
+        .begin(&mut eval, snapshot.clone(), batch, PlannerConfig::default())
+        .unwrap();
+    // Dispatch: four logical members; frame 0 blocks gate 1, frame 1 waits
+    // gate 2, frames 2/3 run to completion right away in the same FIFO pass.
+    assert!(driver.poll(&mut eval, &pool).unwrap().is_none());
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("frame 0 never entered gate 1");
+    // Replace with a fresh request BEFORE opening any gate, and poll once so
+    // the new plan actually queues its task behind the occupied quota.
+    let new_snapshot = {
+        let safe_flag = safe_flag.clone();
+        let _ = state
+            .edit(|e| {
+                e.replace(node, (), move || Payload {
+                    value: 42,
+                    destructor: safe_flag.clone(),
+                })
+            })
+            .unwrap();
+        state.snapshot()
+    };
+    let mut batch = RequestBatch::new();
+    batch.at(FrameIndex(0)).request(node);
+    let new_generation = driver
+        .begin(
+            &mut eval,
+            new_snapshot.clone(),
+            batch,
+            PlannerConfig::default(),
+        )
+        .unwrap();
+    assert_ne!(old_generation, new_generation);
+    // Four physical dispatch slots are occupied (running = 4), so the poll
+    // admits the replacement's new task only into the pending queue.
+    assert!(driver.poll(&mut eval, &pool).unwrap().is_none());
+    let stats = driver.stats();
+    assert_eq!(stats.dispatched, 4, "replacement must stay undispatched");
+    // Release gate 1 only: frame 0 finishes and its obsolete payload
+    // destructor panics exactly once (shared flag consumed).
+    {
+        let (lock, ready) = &*gate1;
+        *lock.lock().unwrap() = true;
+        ready.notify_all();
+    }
+    started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("frame 1 never entered gate 2");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
+            driver.poll(&mut eval, &pool).unwrap();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }))
+        .is_err(),
+        "obsolete payload destructor must panic the poll"
+    );
+    // The panicking poll terminated the active request and canceled its one
+    // queued replacement task; frames 1/2/3 remain running as residue.
+    assert!(!flag.load(Ordering::Relaxed));
+    assert_eq!(driver.in_flight(), 3);
+    let stats = driver.stats();
+    assert_eq!(
+        stats.canceled_pending, 1,
+        "queued replacement must be canceled"
+    );
+    // The canceled active request refuses its token.
+    assert!(!driver.cancel(new_generation));
+    // Release gate 2 (the flag is exhausted; no further payload panics): all
+    // four obsolete members drain to natural terminals.
+    {
+        let (lock, ready) = &*gate2;
+        *lock.lock().unwrap() = true;
+        ready.notify_all();
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while driver.in_flight() > 0 {
+        assert!(driver.poll(&mut eval, &pool).unwrap().is_none());
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let stats = driver.stats();
+    assert_eq!(stats.obsolete, 4);
+    assert_eq!(stats.terminal, 4);
+    // A fresh request after full reclamation computes the NEW definition and
+    // must deliver the actual new value 42 for the new snapshot.
+    let mut batch = RequestBatch::new();
+    let id = batch.at(FrameIndex(0)).request(node);
+    driver
+        .begin(
+            &mut eval,
+            new_snapshot.clone(),
+            batch,
+            PlannerConfig::default(),
+        )
+        .unwrap();
+    let results = complete(&mut driver, &mut eval, &pool);
+    let payload = results.get_shared(id).unwrap();
+    assert_eq!(payload.value, 42);
+    assert_eq!(results.snapshot_id(), new_snapshot.id());
+    drop(payload);
+    assert!(!safe_flag.load(Ordering::Relaxed));
+    assert_eq!(driver.in_flight(), 0);
+    let stats = driver.stats();
+    assert_eq!(stats.terminal, 5);
+}
+#[test]
+fn chunk4_cache_commit_panic_terminates_plan_and_keeps_residue() {
+    use std::sync::atomic::AtomicBool;
+    struct Releaser {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+    impl Drop for Releaser {
+        fn drop(&mut self) {
+            let (lock, ready) = &*self.gate;
+            *lock.lock().unwrap() = true;
+            ready.notify_all();
+        }
+    }
+    struct Victim {
+        frame: u64,
+        panic: Arc<AtomicBool>,
+    }
+    impl Drop for Victim {
+        fn drop(&mut self) {
+            assert!(
+                !self.panic.swap(false, Ordering::Relaxed),
+                "memo victim destructor"
+            );
+        }
+    }
+    let pool = TaskPoolBuilder::new().num_threads(4).build();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let _releaser = Releaser { gate: gate.clone() };
+    let flag = Arc::new(AtomicBool::new(false));
+    let (started_tx, started_rx) = mpsc::channel();
+    let mut state = GraphState::new();
+    let node = state
+        .edit(|e| {
+            let gate = gate.clone();
+            let flag = flag.clone();
+            e.map(e.frame(), move |f: &FrameIndex| {
+                if f.0 == 2 {
+                    // Ready order sorts by node then frame: frames 1,2,3,4 run
+                    // FIFO, so frame 2 is the SECOND member. Holding it lets
+                    // the frame-1 completion commit first and evict the warm
+                    // victim while the plan is still active.
+                    let (lock, ready) = &*gate;
+                    let mut open = lock.lock().unwrap();
+                    let _ = started_tx.send(());
+                    while !*open {
+                        open = ready.wait(open).unwrap();
+                    }
+                }
+                Victim {
+                    frame: f.0,
+                    panic: flag.clone(),
+                }
+            })
+        })
+        .unwrap();
+    let mut eval = Evaluator::new(&state);
+    // The node stays Memo Last / Context Off for the whole fixture; policy is
+    // read at commit time, so the warm frame-0 victim occupies the single
+    // memo entry until a later commit evicts it.
+    eval.configure_cache(
+        node,
+        NodeCacheConfig {
+            memo: CachePolicy::Last,
+            context: CachePolicy::Off,
+        },
+    )
+    .unwrap();
+    let mut warm_batch = RequestBatch::new();
+    warm_batch.at(FrameIndex(0)).request(node);
+    {
+        let mut plan = eval
+            .plan(state.snapshot(), warm_batch, PlannerConfig::default())
+            .unwrap();
+        let mut completed = Vec::new();
+        while !plan.is_complete() {
+            let tasks = eval.advance(&mut plan, completed).unwrap();
+            completed = tasks.into_iter().map(|t| t.execute()).collect();
+        }
+        plan.finish().unwrap();
+    }
+    let calls_after_warm = eval.stats().computation_calls;
+    assert_eq!(calls_after_warm, 1);
+    // Arm the flag: the NEXT eviction of the frame-0 victim panics. Commits
+    // still write into the same memo store (policy is read at commit time)
+    // and evict the armed victim.
+    flag.store(true, Ordering::Relaxed);
+    let snapshot = state.snapshot();
+    let mut driver = AsyncDriver::new(
+        snapshot.clone(),
+        TaskLimits {
+            max_in_flight: 4,
+            max_pending: 4,
+        },
+        4,
+    );
+    let mut batch = RequestBatch::new();
+    for f in 1..5_u64 {
+        batch.at(FrameIndex(f)).request(node);
+    }
+    let failed_generation = driver
+        .begin(&mut eval, snapshot.clone(), batch, PlannerConfig::default())
+        .unwrap();
+    // Frames 1..4 dispatch as one chunk; frame 2 blocks the gate after frame 1
+    // delivered its completion.
+    driver.poll(&mut eval, &pool).unwrap();
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
+            driver.poll(&mut eval, &pool).unwrap();
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }))
+        .is_err(),
+        "evicted warm victim must panic the commit"
+    );
+    assert!(!flag.load(Ordering::Relaxed));
+    // The commit panic terminated the plan; the frame-2 worker plus frames 3/4
+    // remain as residue running.
+    assert_eq!(driver.in_flight(), 3);
+    // The failed generation cannot cancel its already-terminal plan.
+    assert!(!driver.cancel(failed_generation));
+    // Release the gate; every residue worker reaches one natural terminal.
+    {
+        let (lock, ready) = &*gate;
+        *lock.lock().unwrap() = true;
+        ready.notify_all();
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while driver.in_flight() > 0 {
+        assert!(driver.poll(&mut eval, &pool).unwrap().is_none());
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let stats = driver.stats();
+    // All four members dispatched and terminated (their results were never
+    // published: the plan died at the commit panic).
+    assert_eq!(stats.dispatched, 4);
+    assert_eq!(stats.terminal, 4);
+    // computation_calls counts accepted planned completions only: warm(1) +
+    // f1(1). The canceled remainder (f2/f3/f4) runs as obsolete workers and
+    // never publishes or counts.
+    assert_eq!(eval.stats().computation_calls, calls_after_warm + 1);
+    // A fresh request after the failure recomputes frame 1 (its memo entry
+    // was evicted by the panicking commit) and delivers the real value.
+    let mut batch = RequestBatch::new();
+    let id = batch.at(FrameIndex(1)).request(node);
+    driver
+        .begin(&mut eval, snapshot.clone(), batch, PlannerConfig::default())
+        .unwrap();
+    let results = complete(&mut driver, &mut eval, &pool);
+    assert_eq!(results.get_shared(id).unwrap().frame, 1);
+    assert_eq!(driver.in_flight(), 0);
+    let stats = driver.stats();
+    assert_eq!(stats.terminal, 5);
+    // accepted planned completions: warm(1) + f1(1) + fresh f1(1) = 3 — the
+    // same count contract as the original chunk-1 cache-commit fixture.
+    assert_eq!(eval.stats().computation_calls, calls_after_warm + 2);
 }

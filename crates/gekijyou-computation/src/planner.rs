@@ -116,12 +116,99 @@ impl ComputeTask {
         if tasks.len() <= 1 || !tasks.iter().any(|task| task.batch.is_some()) {
             return tasks.into_iter().map(ComputeTask::execute).collect();
         }
+        // Homogeneous wave: every task shares one plan, snapshot, and batch
+        // kernel. This is the common shape for a warmed-up evaluation, so the
+        // group-then-replay machinery below (two grouping Vecs plus an
+        // index-addressed completion placeholder) is pure overhead here.
+        let first_key = tasks[0]
+            .batch
+            .as_ref()
+            .map(|batch| (tasks[0].plan, tasks[0].snapshot.id(), batch.id));
+        if let Some(first_key) = first_key
+            && tasks.iter().all(|task| {
+                task.batch
+                    .as_ref()
+                    .map(|batch| (task.plan, task.snapshot.id(), batch.id))
+                    == Some(first_key)
+            })
+        {
+            let meta: smallvec::SmallVec<[(ComputeTaskId, PlanId); 64]> =
+                tasks.iter().map(|task| (task.id, task.plan)).collect();
+            let outcome = catch_unwind(AssertUnwindSafe(move || {
+                let mut arg_storage: smallvec::SmallVec<
+                    [smallvec::SmallVec<[&dyn std::any::Any; 4]>; 64],
+                > = smallvec::SmallVec::with_capacity(tasks.len());
+                for task in &tasks {
+                    arg_storage.push(
+                        task.inputs
+                            .iter()
+                            .map(|value| value.as_ref() as &dyn std::any::Any)
+                            .collect(),
+                    );
+                }
+                let mut call_items: smallvec::SmallVec<
+                    [(&dyn std::any::Any, &[&dyn std::any::Any]); 64],
+                > = smallvec::SmallVec::with_capacity(tasks.len());
+                for (index, task) in tasks.iter().enumerate() {
+                    let batch = task.batch.as_ref().expect("Batch kernel record");
+                    call_items.push((
+                        batch.param.as_ref() as &dyn std::any::Any,
+                        arg_storage[index].as_slice(),
+                    ));
+                }
+                let kernel = tasks[0]
+                    .batch
+                    .as_ref()
+                    .expect("Batch kernel record")
+                    .kernel
+                    .clone();
+                let mut outputs: smallvec::SmallVec<[SharedValue; 64]> = smallvec::SmallVec::new();
+                (kernel)(&call_items, &mut outputs);
+                assert_eq!(
+                    outputs.len(),
+                    tasks.len(),
+                    "Batch kernel output count mismatch"
+                );
+                for (task, output) in tasks.iter().zip(&outputs) {
+                    if output.as_ref().type_id()
+                        != task.snapshot.graph.node_record(task.node)?.type_id
+                    {
+                        return Err(super::GraphError::TypeMismatch { node: task.node }.into());
+                    }
+                }
+                drop(call_items);
+                drop(arg_storage);
+                drop(tasks);
+                Ok(outputs)
+            }))
+            .unwrap_or(Err(EvalError::WorkerPanicked));
+            return match outcome {
+                Ok(outputs) => meta
+                    .into_iter()
+                    .zip(outputs)
+                    .map(|((id, plan), output)| ComputeCompletion {
+                        id,
+                        plan,
+                        result: Ok(output),
+                    })
+                    .collect(),
+                Err(error) => meta
+                    .into_iter()
+                    .map(|(id, plan)| ComputeCompletion {
+                        id,
+                        plan,
+                        result: Err(error),
+                    })
+                    .collect(),
+            };
+        }
         let mut completions: Vec<Option<ComputeCompletion>> =
             (0..tasks.len()).map(|_| None).collect();
         let mut groups: Vec<(
             (PlanId, super::SnapshotId, KernelId),
             Vec<(usize, ComputeTask)>,
         )> = Vec::new();
+        let task_count = tasks.len();
         for (index, task) in tasks.into_iter().enumerate() {
             let key = task
                 .batch
@@ -130,7 +217,11 @@ impl ComputeTask {
             match key {
                 Some(key) => match groups.iter_mut().find(|(existing, _)| *existing == key) {
                     Some((_, group)) => group.push((index, task)),
-                    None => groups.push((key, vec![(index, task)])),
+                    None => groups.push((key, {
+                        let mut group = Vec::with_capacity(task_count);
+                        group.push((index, task));
+                        group
+                    })),
                 },
                 None => completions[index] = Some(task.execute()),
             }

@@ -15,6 +15,11 @@ pub(crate) type ErasedBatchKernel = dyn Fn(&[(&dyn Any, &[&dyn Any])], &mut smal
     + Sync
     + 'static;
 
+/// Erased single-item batch computation: one parameter and its argument slice,
+/// producing exactly one output. Avoids materializing any `SmallVec`.
+pub(crate) type ErasedSingleBatch =
+    dyn Fn(&dyn Any, &[&dyn Any]) -> SharedValue + Send + Sync + 'static;
+
 /// Batch kernel identity plus the per-node parameter captured at insertion.
 #[derive(Clone)]
 pub(crate) struct BatchKernelRecord {

@@ -5,8 +5,59 @@ use super::{
 use std::{
     any::{Any, TypeId},
     marker::PhantomData,
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
+
+/// Monotonic slot assignment for the thread-local scratch slot. Masked to the
+/// pool size so more threads than slots simply share cache lines.
+static NEXT_THREAD_SLOT: AtomicUsize = AtomicUsize::new(0);
+std::thread_local! {
+    static THREAD_SLOT: usize = NEXT_THREAD_SLOT.fetch_add(1, Ordering::Relaxed) & 15;
+}
+
+/// A cache-line-aligned mutex-guarded reusable scratch buffer.
+#[repr(align(64))]
+struct ScratchSlot<T>(Mutex<Vec<T>>);
+
+/// Fixed pool of per-thread scratch buffers. Each thread prefers its own slot;
+/// contention, or an unexpected reentrant borrow, falls back to a fresh `Vec`
+/// rather than blocking.
+struct BatchScratchPool<T>([ScratchSlot<T>; 16]);
+
+impl<T> BatchScratchPool<T> {
+    fn new() -> Self {
+        Self(std::array::from_fn(|_| {
+            ScratchSlot(Mutex::new(Vec::with_capacity(64)))
+        }))
+    }
+
+    fn take(&self, min_cap: usize) -> Vec<T> {
+        let slot = THREAD_SLOT.with(|&s| s);
+        if let Ok(mut guard) = self.0[slot].0.try_lock() {
+            let mut vec = std::mem::take(&mut *guard);
+            if vec.capacity() < min_cap {
+                vec.reserve(min_cap - vec.len());
+            }
+            return vec;
+        }
+        Vec::with_capacity(min_cap.max(64))
+    }
+
+    fn put(&self, mut vec: Vec<T>) {
+        vec.clear();
+        if vec.capacity() <= 64 || std::mem::size_of::<T>() == 0 {
+            let slot = THREAD_SLOT.with(|&s| s);
+            if let Ok(mut guard) = self.0[slot].0.try_lock() {
+                if guard.capacity() == 0 {
+                    *guard = vec;
+                }
+            }
+        }
+    }
+}
 
 /// Ordered typed dependencies: `()`, `Node<T>`, or tuples of one to twelve Nodes.
 /// Custom adapters delegate to these shapes, preserving the erased output type.
@@ -281,7 +332,8 @@ where
         let param_for_single = param.clone();
         let computation: Arc<ErasedComputation> = Arc::new(move |args: &[&dyn Any]| {
             let items = [(param_for_single.as_ref() as &dyn Any, args)];
-            let mut outputs = (kernel_fn)(&items);
+            let mut outputs: smallvec::SmallVec<[SharedValue; 64]> = smallvec::SmallVec::new();
+            (kernel_fn)(&items, &mut outputs);
             outputs.pop().expect("Batch kernel single output")
         });
         BatchNodeDefinition::new(
@@ -303,9 +355,11 @@ where
     F: Fn(&[&P], &mut Vec<O>) + Send + Sync + 'static,
 {
     fn build_kernel(f: F) -> BatchKernel<P, Self, O> {
-        let kernel: Arc<ErasedBatchKernel> =
-            Arc::new(move |batch: &[(&dyn Any, &[&dyn Any])]| {
-                let params: smallvec::SmallVec<[&P; 16]> = batch
+        let scratch = BatchScratchPool::<O>::new();
+        let kernel: Arc<ErasedBatchKernel> = Arc::new(
+            move |batch: &[(&dyn Any, &[&dyn Any])],
+                  out: &mut smallvec::SmallVec<[SharedValue; 64]>| {
+                let params: smallvec::SmallVec<[&P; 64]> = batch
                     .iter()
                     .map(|(param, args)| {
                         assert!(args.is_empty(), "Invalid input count");
@@ -314,18 +368,24 @@ where
                             .expect("Batch parameter type mismatch")
                     })
                     .collect();
-                let mut outputs = Vec::with_capacity(batch.len());
+                let mut outputs = scratch.take(batch.len());
                 f(&params, &mut outputs);
-                assert_eq!(
-                    outputs.len(),
-                    batch.len(),
-                    "Batch kernel output count mismatch"
-                );
-                outputs
-                    .into_iter()
-                    .map(|o| Arc::new(o) as SharedValue)
-                    .collect()
-            });
+                let actual_len = outputs.len();
+                if actual_len != batch.len() {
+                    scratch.put(outputs);
+                    panic!(
+                        "Batch kernel output count mismatch: expected {}, got {}",
+                        batch.len(),
+                        actual_len
+                    );
+                }
+                out.reserve(batch.len());
+                for o in outputs.drain(..) {
+                    out.push(Arc::new(o) as SharedValue);
+                }
+                scratch.put(outputs);
+            },
+        );
         BatchKernel {
             id: KernelId::new(),
             kernel,
@@ -344,9 +404,11 @@ macro_rules! impl_batch_inputs {
             F: Fn(&[(&P, $(&$T),+)], &mut Vec<O>) + Send + Sync + 'static,
         {
             fn build_kernel(f: F) -> BatchKernel<P, Self, O> {
-                let kernel: Arc<ErasedBatchKernel> =
-                    Arc::new(move |batch: &[(&dyn Any, &[&dyn Any])]| {
-                        let items: smallvec::SmallVec<[(&P, $(&$T),+); 16]> = batch
+                let scratch = BatchScratchPool::<O>::new();
+                let kernel: Arc<ErasedBatchKernel> = Arc::new(
+                    move |batch: &[(&dyn Any, &[&dyn Any])],
+                          out: &mut smallvec::SmallVec<[SharedValue; 64]>| {
+                        let items: smallvec::SmallVec<[(&P, $(&$T),+); 64]> = batch
                             .iter()
                             .map(|(param, args)| {
                                 let [$($node,)+] = args else {
@@ -363,18 +425,24 @@ macro_rules! impl_batch_inputs {
                                 (param, $($node),+)
                             })
                             .collect();
-                        let mut outputs = Vec::with_capacity(batch.len());
+                        let mut outputs = scratch.take(batch.len());
                         f(&items, &mut outputs);
-                        assert_eq!(
-                            outputs.len(),
-                            batch.len(),
-                            "Batch kernel output count mismatch"
-                        );
-                        outputs
-                            .into_iter()
-                            .map(|o| Arc::new(o) as SharedValue)
-                            .collect()
-                    });
+                        let actual_len = outputs.len();
+                        if actual_len != batch.len() {
+                            scratch.put(outputs);
+                            panic!(
+                                "Batch kernel output count mismatch: expected {}, got {}",
+                                batch.len(),
+                                actual_len
+                            );
+                        }
+                        out.reserve(batch.len());
+                        for o in outputs.drain(..) {
+                            out.push(Arc::new(o) as SharedValue);
+                        }
+                        scratch.put(outputs);
+                    },
+                );
                 BatchKernel {
                     id: KernelId::new(),
                     kernel,
@@ -408,7 +476,9 @@ macro_rules! impl_batch_inputs {
                 let computation: Arc<ErasedComputation> =
                     Arc::new(move |args: &[&dyn Any]| {
                         let items = [(param_for_single.as_ref() as &dyn Any, args)];
-                        let mut outputs = (kernel_fn)(&items);
+                        let mut outputs: smallvec::SmallVec<[SharedValue; 64]> =
+                            smallvec::SmallVec::new();
+                        (kernel_fn)(&items, &mut outputs);
                         outputs.pop().expect("Batch kernel single output")
                     });
                 BatchNodeDefinition::new(
@@ -435,9 +505,11 @@ macro_rules! impl_batch_inputs {
             F: Fn(&[(&P, &$T)], &mut Vec<O>) + Send + Sync + 'static,
         {
             fn build_kernel(f: F) -> BatchKernel<P, Self, O> {
-                let kernel: Arc<ErasedBatchKernel> =
-                    Arc::new(move |batch: &[(&dyn Any, &[&dyn Any])]| {
-                        let items: smallvec::SmallVec<[(&P, &$T); 16]> = batch
+                let scratch = BatchScratchPool::<O>::new();
+                let kernel: Arc<ErasedBatchKernel> = Arc::new(
+                    move |batch: &[(&dyn Any, &[&dyn Any])],
+                          out: &mut smallvec::SmallVec<[SharedValue; 64]>| {
+                        let items: smallvec::SmallVec<[(&P, &$T); 64]> = batch
                             .iter()
                             .map(|(param, args)| {
                                 let [$node] = args else {
@@ -452,18 +524,24 @@ macro_rules! impl_batch_inputs {
                                 (param, $node)
                             })
                             .collect();
-                        let mut outputs = Vec::with_capacity(batch.len());
+                        let mut outputs = scratch.take(batch.len());
                         f(&items, &mut outputs);
-                        assert_eq!(
-                            outputs.len(),
-                            batch.len(),
-                            "Batch kernel output count mismatch"
-                        );
-                        outputs
-                            .into_iter()
-                            .map(|o| Arc::new(o) as SharedValue)
-                            .collect()
-                    });
+                        let actual_len = outputs.len();
+                        if actual_len != batch.len() {
+                            scratch.put(outputs);
+                            panic!(
+                                "Batch kernel output count mismatch: expected {}, got {}",
+                                batch.len(),
+                                actual_len
+                            );
+                        }
+                        out.reserve(batch.len());
+                        for o in outputs.drain(..) {
+                            out.push(Arc::new(o) as SharedValue);
+                        }
+                        scratch.put(outputs);
+                    },
+                );
                 BatchKernel {
                     id: KernelId::new(),
                     kernel,
@@ -495,7 +573,9 @@ macro_rules! impl_batch_inputs {
                 let computation: Arc<ErasedComputation> =
                     Arc::new(move |args: &[&dyn Any]| {
                         let items = [(param_for_single.as_ref() as &dyn Any, args)];
-                        let mut outputs = (kernel_fn)(&items);
+                        let mut outputs: smallvec::SmallVec<[SharedValue; 64]> =
+                            smallvec::SmallVec::new();
+                        (kernel_fn)(&items, &mut outputs);
                         outputs.pop().expect("Batch kernel single output")
                     });
                 BatchNodeDefinition::new(

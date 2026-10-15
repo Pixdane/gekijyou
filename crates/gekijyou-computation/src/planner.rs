@@ -142,13 +142,13 @@ impl ComputeTask {
                 }
                 continue;
             }
-            let meta: smallvec::SmallVec<[(usize, ComputeTaskId, PlanId); 16]> = group
+            let meta: smallvec::SmallVec<[(usize, ComputeTaskId, PlanId); 64]> = group
                 .iter()
                 .map(|(index, task)| (*index, task.id, task.plan))
                 .collect();
             let outcome = catch_unwind(AssertUnwindSafe(move || {
                 let mut arg_storage: smallvec::SmallVec<
-                    [smallvec::SmallVec<[&dyn std::any::Any; 4]>; 16],
+                    [smallvec::SmallVec<[&dyn std::any::Any; 4]>; 64],
                 > = smallvec::SmallVec::with_capacity(group.len());
                 for (_, task) in &group {
                     arg_storage.push(
@@ -159,7 +159,7 @@ impl ComputeTask {
                     );
                 }
                 let mut call_items: smallvec::SmallVec<
-                    [(&dyn std::any::Any, &[&dyn std::any::Any]); 16],
+                    [(&dyn std::any::Any, &[&dyn std::any::Any]); 64],
                 > = smallvec::SmallVec::with_capacity(group.len());
                 for (index, (_, task)) in group.iter().enumerate() {
                     let batch = task.batch.as_ref().expect("Batch kernel record");
@@ -175,7 +175,8 @@ impl ComputeTask {
                     .expect("Batch kernel record")
                     .kernel
                     .clone();
-                let outputs = (kernel)(&call_items);
+                let mut outputs: smallvec::SmallVec<[SharedValue; 64]> = smallvec::SmallVec::new();
+                (kernel)(&call_items, &mut outputs);
                 assert_eq!(
                     outputs.len(),
                     group.len(),

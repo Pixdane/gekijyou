@@ -10,8 +10,10 @@ pub(super) type ErasedComputation = dyn Fn(&[&dyn Any]) -> SharedValue + Send + 
 
 /// Erased vectorized batch computation: one parameter and ordered argument slice
 /// per element, producing one output per element in the same order.
-pub(crate) type ErasedBatchKernel =
-    dyn Fn(&[(&dyn Any, &[&dyn Any])]) -> Vec<SharedValue> + Send + Sync + 'static;
+pub(crate) type ErasedBatchKernel = dyn Fn(&[(&dyn Any, &[&dyn Any])], &mut smallvec::SmallVec<[SharedValue; 64]>)
+    + Send
+    + Sync
+    + 'static;
 
 /// Batch kernel identity plus the per-node parameter captured at insertion.
 #[derive(Clone)]

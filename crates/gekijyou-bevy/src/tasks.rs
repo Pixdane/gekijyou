@@ -355,44 +355,55 @@ impl<R: Send + 'static> TaskCoordinator<R> {
                                 .unwrap_or(Err(EvalError::WorkerPanicked));
                             guard.finish(result);
                         }
-                        QueuedWork::Compute(task, map) => match task.kernel_id() {
-                            // Non-batch tasks deliver their terminal message
-                            // immediately, before any gated successor.
-                            None => {
+                        QueuedWork::Compute(task, map) => {
+                            let snapshot_id = task.snapshot_id();
+                            // Only pay for batching buffers when a queued
+                            // successor really shares this kernel and snapshot.
+                            let has_consecutive = task.kernel_id().is_some_and(|kernel_id| {
+                                iter.peek().is_some_and(|(next, _)| match &next.work {
+                                    QueuedWork::Compute(next_task, _) => {
+                                        next_task.kernel_id() == Some(kernel_id)
+                                            && next_task.snapshot_id() == snapshot_id
+                                    }
+                                    QueuedWork::Job(_) => false,
+                                })
+                            });
+                            if !has_consecutive {
+                                // Non-batch tasks, and lone batch tasks with no
+                                // consecutive partner, deliver their terminal
+                                // message immediately, before any successor.
                                 let completion = task.execute();
                                 let result = match completion.failure() {
                                     Some(error) => Err(error),
                                     None => Ok(map(completion)),
                                 };
                                 guard.finish(result);
-                            }
-                            Some(kernel_id) => {
-                                let snapshot_id = task.snapshot_id();
-                                let mut tasks = vec![task];
-                                let mut tail: Vec<(TerminalGuard<R>, fn(ComputeCompletion) -> R)> =
-                                    vec![(guard, map)];
-                                loop {
-                                    let consecutive = match iter.peek() {
-                                        Some((next, _)) => match &next.work {
-                                            QueuedWork::Compute(next_task, _) => {
-                                                next_task.kernel_id() == Some(kernel_id)
-                                                    && next_task.snapshot_id() == snapshot_id
-                                            }
-                                            _ => false,
-                                        },
-                                        None => false,
+                            } else {
+                                let kernel_id = task.kernel_id().unwrap();
+                                let cap = iter.len() + 1;
+                                let mut tasks = Vec::with_capacity(cap);
+                                let mut tail: SmallVec<
+                                    [(TerminalGuard<R>, fn(ComputeCompletion) -> R); 16],
+                                > = SmallVec::with_capacity(cap);
+                                tasks.push(task);
+                                tail.push((guard, map));
+                                while let Some((next, _)) = iter.peek() {
+                                    let matches = match &next.work {
+                                        QueuedWork::Compute(next_task, _) => {
+                                            next_task.kernel_id() == Some(kernel_id)
+                                                && next_task.snapshot_id() == snapshot_id
+                                        }
+                                        QueuedWork::Job(_) => false,
                                     };
-                                    if !consecutive {
+                                    if !matches {
                                         break;
                                     }
                                     let (next, next_guard) = iter.next().unwrap();
-                                    match next.work {
-                                        QueuedWork::Compute(next_task, next_map) => {
-                                            tasks.push(next_task);
-                                            tail.push((next_guard, next_map));
-                                        }
-                                        _ => unreachable!(),
-                                    }
+                                    let QueuedWork::Compute(next_task, next_map) = next.work else {
+                                        unreachable!()
+                                    };
+                                    tasks.push(next_task);
+                                    tail.push((next_guard, next_map));
                                 }
                                 let completions = ComputeTask::execute_batch(tasks);
                                 for ((guard, map), completion) in tail.into_iter().zip(completions)
@@ -404,7 +415,7 @@ impl<R: Send + 'static> TaskCoordinator<R> {
                                     guard.finish(result);
                                 }
                             }
-                        },
+                        }
                     }
                 }
             })

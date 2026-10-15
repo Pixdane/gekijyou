@@ -169,7 +169,7 @@ impl AsyncDriver {
         pool: &TaskPool,
     ) -> Result<Option<(EvaluationResults, PlannerStats)>, EvalError> {
         let finished = self.tracker().poll_completions();
-        let mut completed = Vec::new();
+        let mut completed = Vec::with_capacity(finished.len());
         for task in finished {
             completed.push(task.result?);
         }

@@ -178,20 +178,33 @@ impl ComputeTask {
                 }
                 drop(call_items);
                 drop(arg_storage);
-                drop(tasks);
-                Ok(outputs)
+                // Consume `tasks` in place. `Vec<ComputeTask>::into_iter().map(..)`
+                // collecting into `Vec<ComputeCompletion>` is an exact in-place
+                // collect (identical alignment, and `size_of::<ComputeTask>()`,
+                // 120, is an exact multiple of `size_of::<ComputeCompletion>()`,
+                // 40), so the task allocation itself becomes the completions
+                // allocation instead of a second heap allocation.
+                let mut outputs_iter = outputs.into_iter();
+                Ok(tasks
+                    .into_iter()
+                    .map(|task| {
+                        let id = task.id;
+                        let plan = task.plan;
+                        let output = outputs_iter
+                            .next()
+                            .expect("Batch kernel output count mismatch");
+                        drop(task);
+                        ComputeCompletion {
+                            id,
+                            plan,
+                            result: Ok(output),
+                        }
+                    })
+                    .collect())
             }))
             .unwrap_or(Err(EvalError::WorkerPanicked));
             return match outcome {
-                Ok(outputs) => meta
-                    .into_iter()
-                    .zip(outputs)
-                    .map(|((id, plan), output)| ComputeCompletion {
-                        id,
-                        plan,
-                        result: Ok(output),
-                    })
-                    .collect(),
+                Ok(completions) => completions,
                 Err(error) => meta
                     .into_iter()
                     .map(|(id, plan)| ComputeCompletion {

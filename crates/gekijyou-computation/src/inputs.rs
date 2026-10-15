@@ -6,6 +6,7 @@ use super::{
 };
 use std::{
     any::{Any, TypeId},
+    cell::Cell,
     marker::PhantomData,
     sync::{
         Arc, Mutex,
@@ -17,7 +18,26 @@ use std::{
 /// size so more threads than slots simply start their scan elsewhere.
 static NEXT_THREAD_SLOT: AtomicUsize = AtomicUsize::new(0);
 std::thread_local! {
-    static THREAD_SLOT: usize = NEXT_THREAD_SLOT.fetch_add(1, Ordering::Relaxed) & 15;
+    /// `usize::MAX` marks a thread that has not picked a slot yet. `const`
+    /// initialization is deliberate: a runtime-initialized TLS value registers a
+    /// heap-allocated init/destructor node the first time each newly spawned
+    /// worker thread touches it.
+    static THREAD_SLOT: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+/// Resolves this thread's preferred pool slot, assigning one on first use.
+#[inline]
+fn thread_slot() -> usize {
+    THREAD_SLOT.with(|cell| {
+        let slot = cell.get();
+        if slot != usize::MAX {
+            slot
+        } else {
+            let next = NEXT_THREAD_SLOT.fetch_add(1, Ordering::Relaxed) & 15;
+            cell.set(next);
+            next
+        }
+    })
 }
 
 /// A cache-line-aligned mutex-guarded reusable scratch buffer.
@@ -44,7 +64,7 @@ impl<T> BatchScratchPool<T> {
     /// Takes a scratch buffer plus the slot it came from. The returned index must
     /// be passed back to [`Self::put`] so the buffer is returned to a pool slot.
     fn take(&self, min_cap: usize) -> (usize, Vec<T>) {
-        let start = THREAD_SLOT.with(|&s| s);
+        let start = thread_slot();
         for offset in 0..16 {
             let idx = (start + offset) & 15;
             if let Ok(mut guard) = self.0[idx].0.try_lock() {

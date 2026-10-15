@@ -1,5 +1,7 @@
 use bevy_tasks::TaskPool;
-use gekijyou_computation::{EvalError, EvaluationSnapshot, SnapshotId};
+use gekijyou_computation::{
+    ComputeCompletion, ComputeTask, EvalError, EvaluationSnapshot, SnapshotId,
+};
 use smallvec::SmallVec;
 use std::{
     collections::{HashMap, VecDeque},
@@ -60,11 +62,17 @@ struct Session {
     generation: RequestGeneration,
 }
 type Job<R> = Box<dyn FnOnce(EvaluationSnapshot) -> Result<R, EvalError> + Send>;
+/// Queued unit of work: a generic snapshot job, or one pure compute task whose
+/// result is mapped into the coordinator's result type on the main thread.
+enum QueuedWork<R> {
+    Job(Job<R>),
+    Compute(ComputeTask, fn(ComputeCompletion) -> R),
+}
 struct Queued<R> {
     id: TaskId,
     session: Session,
     snapshot: EvaluationSnapshot,
-    job: Job<R>,
+    work: QueuedWork<R>,
 }
 struct Running {
     session: Session,
@@ -252,7 +260,7 @@ impl<R: Send + 'static> TaskCoordinator<R> {
             id,
             session: self.session(),
             snapshot: self.snapshot.clone(),
-            job: Box::new(job),
+            work: QueuedWork::Job(Box::new(job)),
         });
         id
     }
@@ -339,10 +347,76 @@ impl<R: Send + 'static> TaskCoordinator<R> {
             pool.spawn(async move {
                 // FIFO order inside the chunk; one panicking job never skips
                 // the rest, each task still finishes its own terminal guard.
-                for (queued, guard) in chunk {
-                    let result = catch_unwind(AssertUnwindSafe(|| (queued.job)(queued.snapshot)))
-                        .unwrap_or(Err(EvalError::WorkerPanicked));
-                    guard.finish(result);
+                let mut iter = chunk.into_iter().peekable();
+                while let Some((queued, guard)) = iter.next() {
+                    match queued.work {
+                        QueuedWork::Job(job) => {
+                            let result = catch_unwind(AssertUnwindSafe(|| job(queued.snapshot)))
+                                .unwrap_or(Err(EvalError::WorkerPanicked));
+                            guard.finish(result);
+                        }
+                        QueuedWork::Compute(task, map) => {
+                            let snapshot_id = task.snapshot_id();
+                            // Only pay for batching buffers when a queued
+                            // successor really shares this kernel and snapshot.
+                            let has_consecutive = task.kernel_id().is_some_and(|kernel_id| {
+                                iter.peek().is_some_and(|(next, _)| match &next.work {
+                                    QueuedWork::Compute(next_task, _) => {
+                                        next_task.kernel_id() == Some(kernel_id)
+                                            && next_task.snapshot_id() == snapshot_id
+                                    }
+                                    QueuedWork::Job(_) => false,
+                                })
+                            });
+                            if !has_consecutive {
+                                // Non-batch tasks, and lone batch tasks with no
+                                // consecutive partner, deliver their terminal
+                                // message immediately, before any successor.
+                                let completion = task.execute();
+                                let result = match completion.failure() {
+                                    Some(error) => Err(error),
+                                    None => Ok(map(completion)),
+                                };
+                                guard.finish(result);
+                            } else {
+                                let kernel_id = task.kernel_id().unwrap();
+                                let cap = iter.len() + 1;
+                                let mut tasks = Vec::with_capacity(cap);
+                                let mut tail: SmallVec<
+                                    [(TerminalGuard<R>, fn(ComputeCompletion) -> R); 16],
+                                > = SmallVec::with_capacity(cap);
+                                tasks.push(task);
+                                tail.push((guard, map));
+                                while let Some((next, _)) = iter.peek() {
+                                    let matches = match &next.work {
+                                        QueuedWork::Compute(next_task, _) => {
+                                            next_task.kernel_id() == Some(kernel_id)
+                                                && next_task.snapshot_id() == snapshot_id
+                                        }
+                                        QueuedWork::Job(_) => false,
+                                    };
+                                    if !matches {
+                                        break;
+                                    }
+                                    let (next, next_guard) = iter.next().unwrap();
+                                    let QueuedWork::Compute(next_task, next_map) = next.work else {
+                                        unreachable!()
+                                    };
+                                    tasks.push(next_task);
+                                    tail.push((next_guard, next_map));
+                                }
+                                let completions = ComputeTask::execute_batch(tasks);
+                                for ((guard, map), completion) in tail.into_iter().zip(completions)
+                                {
+                                    let result = match completion.failure() {
+                                        Some(error) => Err(error),
+                                        None => Ok(map(completion)),
+                                    };
+                                    guard.finish(result);
+                                }
+                            }
+                        }
+                    }
                 }
             })
             .detach();
@@ -384,5 +458,37 @@ impl<R: Send + 'static> TaskCoordinator<R> {
             });
         }
         finished
+    }
+}
+
+impl TaskCoordinator<ComputeCompletion> {
+    /// Submits a whole wave of pure compute tasks as one admission decision.
+    /// Rejected whole at capacity, accepted in iteration order, and dispatched
+    /// once in chunks; returns the allocated task identities.
+    pub(crate) fn submit_compute_batch(
+        &mut self,
+        pool: &TaskPool,
+        tasks: Vec<ComputeTask>,
+    ) -> Option<Vec<TaskId>> {
+        let len = tasks.len();
+        if len > self.available() {
+            return None;
+        }
+        let len = u64::try_from(len).expect("Task identity exhausted");
+        self.next.checked_add(len).expect("Task identity exhausted");
+        let mut ids = Vec::with_capacity(len as usize);
+        for task in tasks {
+            let id = TaskId(self.next);
+            self.next = self.next.checked_add(1).expect("Task identity exhausted");
+            self.pending.push_back(Queued {
+                id,
+                session: self.session(),
+                snapshot: self.snapshot.clone(),
+                work: QueuedWork::Compute(task, std::convert::identity),
+            });
+            ids.push(id);
+        }
+        self.dispatch(pool);
+        Some(ids)
     }
 }

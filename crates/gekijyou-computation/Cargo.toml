@@ -7,4 +7,4 @@ license.workspace = true
 [dependencies]
 smallvec.workspace = true
 thiserror.workspace = true
-rustc-hash = "2.1.3"
+rustc-hash.workspace = true

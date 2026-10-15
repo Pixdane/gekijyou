@@ -30,6 +30,16 @@ impl GraphId {
     }
 }
 
+/// Process-local identity of a reusable batch computation kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct KernelId(u64);
+impl KernelId {
+    pub(crate) fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self(next_id(&NEXT))
+    }
+}
+
 /// Non-reused identity within a graph, allocated even for failed transactions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub(crate) u64);
@@ -169,6 +179,7 @@ pub(crate) enum NodeKind {
     Computation {
         inputs: Arc<[Dependency]>,
         computation: Arc<ErasedComputation>,
+        batch: Option<super::value::BatchKernelRecord>,
     },
 }
 #[derive(Clone)]

@@ -33,7 +33,7 @@ impl Executor for BevyExecutor<'_> {
         }
         let completed: Vec<Vec<ComputeCompletion>> = self.pool.scope(|scope| {
             for chunk in chunks {
-                scope.spawn(async move { chunk.into_iter().map(ComputeTask::execute).collect() });
+                scope.spawn(async move { ComputeTask::execute_batch(chunk) });
             }
         });
         completed.into_iter().flatten().collect()
@@ -169,7 +169,7 @@ impl AsyncDriver {
         pool: &TaskPool,
     ) -> Result<Option<(EvaluationResults, PlannerStats)>, EvalError> {
         let finished = self.tracker().poll_completions();
-        let mut completed = Vec::new();
+        let mut completed = Vec::with_capacity(finished.len());
         for task in finished {
             completed.push(task.result?);
         }
@@ -184,19 +184,7 @@ impl AsyncDriver {
         // The batch entry dispatches, including empty batches, so already
         // queued work drains without a separate dispatch_pending call.
         assert!(
-            self.tracker()
-                .submit_batch_fallible(
-                    pool,
-                    tasks.into_iter().map(|task| move |_| {
-                        let completion = task.execute();
-                        if let Some(error) = completion.failure() {
-                            Err(error)
-                        } else {
-                            Ok(completion)
-                        }
-                    })
-                )
-                .is_some(),
+            self.tracker().submit_compute_batch(pool, tasks).is_some(),
             "Reserved task admission failed"
         );
         Ok(None)

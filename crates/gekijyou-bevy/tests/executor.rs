@@ -4,8 +4,8 @@ use bevy_tasks::{TaskPool, TaskPoolBuilder};
 use bevy_transform::components::Transform;
 use gekijyou_bevy::{AsyncDriver, BevyExecutor, Bindings, OutputField, TaskLimits};
 use gekijyou_computation::{
-    CachePolicy, EvalError, EvaluationResults, Evaluator, FrameIndex, GraphError, GraphState,
-    NodeCacheConfig, PlannerConfig, RequestBatch,
+    CachePolicy, EvalError, EvaluationResults, Evaluator, FrameIndex, GraphError, GraphState, Node,
+    NodeCacheConfig, PlannerConfig, RequestBatch, RequestId,
 };
 use std::{
     sync::{
@@ -1442,4 +1442,369 @@ fn chunk4_cache_commit_panic_terminates_plan_and_keeps_residue() {
     // accepted planned completions: warm(1) + f1(1) + fresh f1(1) = 3 — the
     // same count contract as the original chunk-1 cache-commit fixture.
     assert_eq!(eval.stats().computation_calls, calls_after_warm + 2);
+}
+
+/// Lock-free counters shared by the scene closures.
+struct BatchCounters {
+    calls: AtomicUsize,
+    items: AtomicUsize,
+    max_len: AtomicUsize,
+    scalar_runs: AtomicUsize,
+    first_event: AtomicUsize,
+}
+impl Default for BatchCounters {
+    fn default() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            items: AtomicUsize::new(0),
+            max_len: AtomicUsize::new(0),
+            scalar_runs: AtomicUsize::new(0),
+            first_event: AtomicUsize::new(0),
+        }
+    }
+}
+/// Cooperative first-execution markers: whichever of the scalar or batch run
+/// reaches its counter first claims the slot.
+const EVENT_SCALAR: usize = 1;
+const EVENT_BATCH: usize = 2;
+
+/// Batch-kernel scene shared by the coalescing and ordering tests.
+///
+/// `actors` parameterized nodes share one `BatchKernel`. The optional non-batch
+/// scalar node is inserted before them, so the canonical ready order (sorted by
+/// node id) places it ahead of the coalesced batch run in the same chunk.
+struct BatchScene {
+    state: GraphState,
+    scalar: Option<Node<u64>>,
+    actors: Vec<Node<u64>>,
+    counters: Arc<BatchCounters>,
+}
+impl BatchScene {
+    fn new(actors: u64, with_scalar: bool) -> Self {
+        let counters = Arc::new(BatchCounters::default());
+        let mut state = GraphState::new();
+        let (scalar, actor_nodes) = {
+            let counters = counters.clone();
+            state
+                .edit(move |e| {
+                    let source = e.input::<u64>();
+                    e.set(source, 7)?;
+                    let source_node = source.node();
+                    let scalar = if with_scalar {
+                        let counters = counters.clone();
+                        Some(e.map(source_node, move |x: &u64| {
+                            counters.scalar_runs.fetch_add(1, Ordering::Relaxed);
+                            let _ = counters.first_event.compare_exchange(
+                                0,
+                                EVENT_SCALAR,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            );
+                            x + 1
+                        })?)
+                    } else {
+                        None
+                    };
+                    let kernel =
+                        e.batch_kernel(move |items: &[(&u64, &u64)], out: &mut Vec<u64>| {
+                            counters.calls.fetch_add(1, Ordering::Relaxed);
+                            counters.items.fetch_add(items.len(), Ordering::Relaxed);
+                            counters.max_len.fetch_max(items.len(), Ordering::Relaxed);
+                            let _ = counters.first_event.compare_exchange(
+                                0,
+                                EVENT_BATCH,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            );
+                            for &(&actor, &input) in items {
+                                out.push(input.wrapping_add(actor).wrapping_mul(3));
+                            }
+                        });
+                    let actors = (0..actors)
+                        .map(|actor| e.map_batch(&kernel, actor, source_node))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok((scalar, actors))
+                })
+                .unwrap()
+        };
+        Self {
+            state,
+            scalar,
+            actors: actor_nodes,
+            counters,
+        }
+    }
+
+    fn reset(&self) {
+        for counter in [
+            &self.counters.calls,
+            &self.counters.items,
+            &self.counters.max_len,
+            &self.counters.scalar_runs,
+            &self.counters.first_event,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.counters.calls.load(Ordering::Relaxed)
+    }
+
+    fn items(&self) -> usize {
+        self.counters.items.load(Ordering::Relaxed)
+    }
+
+    fn max_len(&self) -> usize {
+        self.counters.max_len.load(Ordering::Relaxed)
+    }
+
+    fn scalar_runs(&self) -> usize {
+        self.counters.scalar_runs.load(Ordering::Relaxed)
+    }
+
+    fn first_event(&self) -> usize {
+        self.counters.first_event.load(Ordering::Relaxed)
+    }
+
+    /// Requests every scene node once at frame 0, paired with its oracle value.
+    fn request_all(&self) -> (RequestBatch, Vec<(u64, RequestId<u64>)>) {
+        let mut batch = RequestBatch::new();
+        let mut expects = Vec::new();
+        if let Some(scalar) = self.scalar {
+            let id = batch.at(FrameIndex(0)).request(scalar);
+            expects.push((8, id));
+        }
+        for (actor, &node) in self.actors.iter().enumerate() {
+            let id = batch.at(FrameIndex(0)).request(node);
+            expects.push(((7 + actor as u64).wrapping_mul(3), id));
+        }
+        (batch, expects)
+    }
+}
+
+#[test]
+fn bevy_executor_batch_kernel_coalesces_up_to_chunk_size() {
+    let pool = TaskPoolBuilder::new().num_threads(4).build();
+    let scene = BatchScene::new(16, false);
+    for chunk in [1usize, 4, 16] {
+        scene.reset();
+        let mut eval = Evaluator::new(&scene.state);
+        let snapshot = scene.state.snapshot();
+        let (batch, expects) = scene.request_all();
+        let (results, _) = eval
+            .bind(snapshot)
+            .unwrap()
+            .evaluate_planned(
+                batch,
+                PlannerConfig::default(),
+                &mut BevyExecutor::new(&pool, chunk),
+            )
+            .unwrap();
+        for (expected, id) in expects {
+            assert_eq!(*results.get(id).unwrap(), expected, "chunk {chunk}");
+        }
+        // Coalescing is physical only: each node is still evaluated once.
+        assert_eq!(eval.stats().computation_calls, 16);
+        assert_eq!(scene.calls(), 16 / chunk, "chunk {chunk}");
+        assert!(
+            scene.max_len() <= chunk,
+            "chunk {chunk} exceeded the chunk size"
+        );
+        assert_eq!(scene.max_len(), chunk, "chunk {chunk}");
+        assert_eq!(scene.items(), 16, "chunk {chunk}");
+    }
+}
+
+#[test]
+fn async_driver_batch_kernel_coalesces_up_to_chunk_size_and_task_limits() {
+    let pool = TaskPoolBuilder::new().num_threads(4).build();
+    let scene = BatchScene::new(16, false);
+    for chunk in [1usize, 4, 16] {
+        scene.reset();
+        let mut eval = Evaluator::new(&scene.state);
+        let mut driver = AsyncDriver::new(
+            scene.state.snapshot(),
+            TaskLimits {
+                max_in_flight: 16,
+                max_pending: 32,
+            },
+            chunk,
+        );
+        let (batch, expects) = scene.request_all();
+        driver
+            .begin(
+                &mut eval,
+                scene.state.snapshot(),
+                batch,
+                PlannerConfig::default(),
+            )
+            .unwrap();
+        let results = complete(&mut driver, &mut eval, &pool);
+        for (expected, id) in expects {
+            assert_eq!(*results.get(id).unwrap(), expected, "chunk {chunk}");
+        }
+        assert!(
+            driver.stats().peak_in_flight <= 16,
+            "chunk {chunk}: {:?}",
+            driver.stats()
+        );
+        assert!(
+            scene.max_len() <= chunk,
+            "chunk {chunk} exceeded the chunk size"
+        );
+        assert_eq!(scene.items(), 16, "chunk {chunk}");
+        // The first dispatch always fills the chunk, so peak coalescing is
+        // bounded by the chunk size rather than per-task dispatch.
+        assert_eq!(scene.max_len(), chunk, "chunk {chunk}");
+    }
+
+    // A tight in-flight limit caps coalescing below the chunk size while the
+    // admitted work still respects the total task quota.
+    scene.reset();
+    let mut eval = Evaluator::new(&scene.state);
+    let mut driver = AsyncDriver::new(
+        scene.state.snapshot(),
+        TaskLimits {
+            max_in_flight: 2,
+            max_pending: 64,
+        },
+        16,
+    );
+    let (batch, expects) = scene.request_all();
+    driver
+        .begin(
+            &mut eval,
+            scene.state.snapshot(),
+            batch,
+            PlannerConfig::default(),
+        )
+        .unwrap();
+    let results = complete(&mut driver, &mut eval, &pool);
+    for (expected, id) in expects {
+        assert_eq!(*results.get(id).unwrap(), expected);
+    }
+    assert!(driver.stats().peak_in_flight <= 2, "{:?}", driver.stats());
+    assert!(
+        scene.max_len() <= 2,
+        "limits must cap coalescing below the chunk size"
+    );
+    assert_eq!(scene.max_len(), 2);
+    assert_eq!(scene.items(), 16);
+}
+
+#[test]
+fn async_driver_cancellation_stops_batch_dispatch_within_limits() {
+    let pool = TaskPoolBuilder::new().num_threads(4).build();
+    let scene = BatchScene::new(16, false);
+    let mut eval = Evaluator::new(&scene.state);
+    let mut driver = AsyncDriver::new(
+        scene.state.snapshot(),
+        TaskLimits {
+            max_in_flight: 2,
+            max_pending: 2,
+        },
+        16,
+    );
+    let (batch, _) = scene.request_all();
+    let generation = driver
+        .begin(
+            &mut eval,
+            scene.state.snapshot(),
+            batch,
+            PlannerConfig::default(),
+        )
+        .unwrap();
+    // The first poll admits the four-task budget, but only one physical chunk
+    // fits inside `max_in_flight`; the remaining two tasks stay pending.
+    assert!(driver.poll(&mut eval, &pool).unwrap().is_none());
+    assert_eq!(driver.stats().dispatched, 2);
+    assert!(driver.cancel(generation));
+    assert!(!driver.cancel(generation));
+    assert_eq!(driver.stats().canceled_pending, 2);
+    // Canceling gates the plan immediately. The single running chunk still
+    // drains to a natural terminal, but the canceled pending tasks never run.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while driver.in_flight() > 0 {
+        assert!(driver.poll(&mut eval, &pool).unwrap().is_none());
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert_eq!(scene.calls(), 1, "canceled pending tasks must not run");
+    assert_eq!(
+        scene.max_len(),
+        2,
+        "the dispatched chunk coalesces both admitted tasks"
+    );
+    assert_eq!(scene.items(), 2);
+    let stats = driver.stats();
+    assert_eq!(stats.terminal, 2);
+    assert_eq!(stats.obsolete, 2);
+    assert_eq!(stats.failed, 0);
+    // A canceled generation cannot be revived.
+    assert!(!driver.cancel(generation));
+}
+
+#[test]
+fn non_batch_tasks_finish_before_gated_batch_successors_in_one_chunk() {
+    let pool = TaskPoolBuilder::new().num_threads(4).build();
+    // One non-batch scalar plus eight batch nodes: nine tasks in a single chunk.
+    let scene = BatchScene::new(8, true);
+
+    // Synchronous parallel executor: the scalar runs, then the coalesced run.
+    scene.reset();
+    let mut eval = Evaluator::new(&scene.state);
+    let (batch, expects) = scene.request_all();
+    let (results, _) = eval
+        .bind(scene.state.snapshot())
+        .unwrap()
+        .evaluate_planned(
+            batch,
+            PlannerConfig::default(),
+            &mut BevyExecutor::new(&pool, 16),
+        )
+        .unwrap();
+    for (expected, id) in expects {
+        assert_eq!(*results.get(id).unwrap(), expected);
+    }
+    assert_eq!(scene.scalar_runs(), 1);
+    assert_eq!(scene.calls(), 1);
+    assert_eq!(
+        scene.first_event(),
+        EVENT_SCALAR,
+        "BevyExecutor must finish the non-batch task before the batch run"
+    );
+
+    // Nonblocking planner adapter: the scalar completion is delivered before
+    // the coalesced batch run inside the same physical chunk.
+    scene.reset();
+    let mut eval = Evaluator::new(&scene.state);
+    let mut driver = AsyncDriver::new(
+        scene.state.snapshot(),
+        TaskLimits {
+            max_in_flight: 16,
+            max_pending: 16,
+        },
+        16,
+    );
+    let (batch, expects) = scene.request_all();
+    driver
+        .begin(
+            &mut eval,
+            scene.state.snapshot(),
+            batch,
+            PlannerConfig::default(),
+        )
+        .unwrap();
+    let results = complete(&mut driver, &mut eval, &pool);
+    for (expected, id) in expects {
+        assert_eq!(*results.get(id).unwrap(), expected);
+    }
+    assert_eq!(scene.scalar_runs(), 1);
+    assert_eq!(scene.calls(), 1);
+    assert_eq!(
+        scene.first_event(),
+        EVENT_SCALAR,
+        "AsyncDriver must finish the non-batch task before the batch run"
+    );
 }

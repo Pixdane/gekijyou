@@ -3,11 +3,11 @@ use bevy_math::{Quat, Vec3};
 use bevy_transform::components::Transform;
 use gekijyou_computation::{
     EvalError, EvaluationResults, EvaluationSnapshot, FrameIndex, GraphEdit, GraphError, GraphId,
-    GraphState, Input, Node, NodeId, RequestBatch, RequestBatchId, RequestId,
+    GraphState, Input, Node, NodeId, RequestBatch, RequestBatchId, RequestTicket,
 };
+use rustc_hash::FxHashMap as HashMap;
 use std::{
-    any::{Any, TypeId},
-    collections::{HashMap, HashSet},
+    any::TypeId,
     marker::PhantomData,
     sync::{
         Arc,
@@ -167,11 +167,12 @@ impl Destination {
 type Check = dyn Fn(&EvaluationSnapshot) -> Result<(), GraphError> + Send + Sync;
 type SyncInput = dyn Fn(&World, &mut GraphEdit) -> Result<(), BindingError> + Send + Sync;
 type ValidateComponent = dyn Fn(&World) -> Result<(), BindingError> + Send + Sync;
-type ApplyOutput = dyn Fn(&mut World, &EvaluationResults) -> Result<(), BindingError> + Send + Sync;
-type ValidateResult = dyn Fn(&EvaluationResults) -> Result<(), EvalError> + Send + Sync;
-type RequestIds = HashMap<(FrameIndex, NodeKey), Box<dyn Any + Send + Sync>>;
-type RequestOutput =
-    dyn Fn(&mut RequestBatch, &mut RequestIds, FrameIndex) -> RequestedOutput + Send + Sync;
+type RequestNode = dyn Fn(&mut RequestBatch, FrameIndex) -> RequestTicket + Send + Sync;
+type ValidateTicket =
+    dyn Fn(&EvaluationResults, RequestTicket) -> Result<(), EvalError> + Send + Sync;
+type ApplyTicket =
+    dyn Fn(&mut World, &EvaluationResults, RequestTicket) -> Result<(), BindingError> + Send + Sync;
+
 struct InputEntry {
     key: NodeKey,
     source: Destination,
@@ -180,19 +181,18 @@ struct InputEntry {
 }
 struct OutputEntry {
     id: u64,
+    node: NodeKey,
     target: Destination,
     check: Box<Check>,
-    request: Box<RequestOutput>,
+    request: Box<RequestNode>,
     validate_component: Box<ValidateComponent>,
+    validate_result: Box<ValidateTicket>,
+    apply: Box<ApplyTicket>,
 }
-struct RequestedOutput {
-    validate: Box<ValidateResult>,
-    apply: Box<ApplyOutput>,
-}
+#[derive(Clone, Copy)]
 struct PlannedOutput {
-    frame: FrameIndex,
     entry: usize,
-    output: RequestedOutput,
+    ticket: RequestTicket,
 }
 
 /// Stable output selection handle. Pruning never reuses a removed handle.
@@ -211,7 +211,7 @@ pub struct BoundRequest {
     snapshot: EvaluationSnapshot,
     registry: u64,
     revision: u64,
-    frames: HashSet<FrameIndex>,
+    frame_slices: HashMap<FrameIndex, std::ops::Range<usize>>,
     outputs: Vec<PlannedOutput>,
 }
 impl BoundRequest {
@@ -223,13 +223,14 @@ impl BoundRequest {
     }
 }
 
-/// Long-lived Node bindings. RequestIds belong to each explicit bound request.
+/// Long-lived Node bindings. Request tickets belong to each explicit bound request.
 /// One input has one authoritative source; outputs check conservative write ranges.
 #[derive(Resource)]
 pub struct Bindings {
     identity: u64,
     inputs: Vec<InputEntry>,
     outputs: Vec<OutputEntry>,
+    output_index: HashMap<u64, usize>,
     revision: u64,
     graph: Option<GraphId>,
 }
@@ -242,6 +243,7 @@ impl Default for Bindings {
                 .expect("Binding identity exhausted"),
             inputs: Vec::new(),
             outputs: Vec::new(),
+            output_index: HashMap::default(),
             revision: 0,
             graph: None,
         }
@@ -332,37 +334,15 @@ impl Bindings {
         }
         self.advance();
         self.graph = Some(snapshot.graph_id());
+        let node_key = NodeKey::of(node);
+        let write = field.write;
+        self.output_index.insert(self.revision, self.outputs.len());
         self.outputs.push(OutputEntry {
             id: self.revision,
+            node: node_key,
             target,
             check: Box::new(move |s| s.graph().check(node)),
-            request: Box::new(move |batch, ids, frame| {
-                let key = (frame, NodeKey::of(node));
-                let id = if let Some(id) = ids.get(&key) {
-                    *id.downcast_ref::<RequestId<T>>()
-                        .expect("Node output type is invariant")
-                } else {
-                    let id = batch.at(frame).request(node);
-                    ids.insert(key, Box::new(id));
-                    id
-                };
-                let write = field.write.clone();
-                RequestedOutput {
-                    validate: Box::new(move |results| results.get(id).map(|_| ())),
-                    apply: Box::new(move |world, results| {
-                        // Despawn after request construction is harmless; never retarget.
-                        if world.get_entity(entity).is_err() {
-                            return Ok(());
-                        }
-                        let value = results.get(id)?;
-                        let mut component = world
-                            .get_mut::<C>(entity)
-                            .ok_or(BindingError::MissingComponent)?;
-                        write(&mut component, value);
-                        Ok(())
-                    }),
-                }
-            }),
+            request: Box::new(move |batch, frame| batch.at(frame).request(node).ticket()),
             validate_component: Box::new(move |world| {
                 if world.get_entity(entity).is_err() {
                     return Ok(());
@@ -370,6 +350,21 @@ impl Bindings {
                 if world.get::<C>(entity).is_none() {
                     return Err(BindingError::MissingComponent);
                 }
+                Ok(())
+            }),
+            validate_result: Box::new(move |results, ticket| {
+                results.get_by_ticket::<T>(ticket).map(|_| ())
+            }),
+            apply: Box::new(move |world, results, ticket| {
+                // Despawn after request construction is harmless; never retarget.
+                if world.get_entity(entity).is_err() {
+                    return Ok(());
+                }
+                let value = results.get_by_ticket::<T>(ticket)?;
+                let mut component = world
+                    .get_mut::<C>(entity)
+                    .ok_or(BindingError::MissingComponent)?;
+                write(&mut component, value);
                 Ok(())
             }),
         });
@@ -387,6 +382,10 @@ impl Bindings {
             .retain(|o| world.get_entity(o.target.entity).is_ok() && (o.check)(snapshot).is_ok());
         let removed = before - self.inputs.len() - self.outputs.len();
         if removed > 0 {
+            self.output_index.clear();
+            for (idx, output) in self.outputs.iter().enumerate() {
+                self.output_index.insert(output.id, idx);
+            }
             self.advance();
         }
         removed
@@ -419,7 +418,7 @@ impl Bindings {
 
     /// Completeness belongs to this selection, not all outputs in the registry.
     /// Duplicate handles/frames are ignored; equal Frame/Node pairs share one typed
-    /// RequestId even when their values are written to several entities.
+    /// request ticket even when their values are written to several entities.
     pub fn request_selected(
         &self,
         snapshot: &EvaluationSnapshot,
@@ -431,10 +430,9 @@ impl Bindings {
             if output.registry != self.identity {
                 return Err(BindingError::UnknownOutput);
             }
-            let index = self
-                .outputs
-                .iter()
-                .position(|o| o.id == output.id)
+            let &index = self
+                .output_index
+                .get(&output.id)
                 .ok_or(BindingError::UnknownOutput)?;
             if !entries.contains(&index) {
                 entries.push(index);
@@ -455,20 +453,22 @@ impl Bindings {
             (self.outputs[entry].check)(snapshot)?;
         }
         let mut batch = RequestBatch::new();
-        let mut ids = HashMap::new();
-        let mut seen = HashSet::new();
-        let mut outputs = Vec::new();
+        let mut tickets: HashMap<(FrameIndex, NodeKey), RequestTicket> = HashMap::default();
+        let mut frame_slices: HashMap<FrameIndex, std::ops::Range<usize>> = HashMap::default();
+        let mut outputs = Vec::with_capacity(frames.len().saturating_mul(entries.len()));
         for &frame in frames {
-            if !seen.insert(frame) {
+            if frame_slices.contains_key(&frame) {
                 continue;
             }
+            let start = outputs.len();
             for &entry in &entries {
-                outputs.push(PlannedOutput {
-                    frame,
-                    entry,
-                    output: (self.outputs[entry].request)(&mut batch, &mut ids, frame),
-                });
+                let output_entry = &self.outputs[entry];
+                let ticket = *tickets
+                    .entry((frame, output_entry.node))
+                    .or_insert_with(|| (output_entry.request)(&mut batch, frame));
+                outputs.push(PlannedOutput { entry, ticket });
             }
+            frame_slices.insert(frame, start..outputs.len());
         }
         Ok(BoundRequest {
             batch_id: batch.id(),
@@ -476,7 +476,7 @@ impl Bindings {
             snapshot: snapshot.clone(),
             registry: self.identity,
             revision: self.revision,
-            frames: seen,
+            frame_slices,
             outputs,
         })
     }
@@ -484,7 +484,7 @@ impl Bindings {
     /// Applies an owned completed result against an explicit computation basis.
     /// Pass the current GraphState snapshot to reject obsolete input/definition
     /// results, or intentionally retain the request snapshot for offline consumption.
-    /// All selected nodes, typed RequestIds, components and identities are checked
+    /// All selected nodes, typed tickets, components and identities are checked
     /// before writing. Despawned destinations are skipped. Custom writer panics do
     /// not roll back earlier writes. Apply never evaluates or touches caches.
     pub fn apply(
@@ -511,17 +511,20 @@ impl Bindings {
         if results.batch_id() != request.batch_id {
             return Err(EvalError::ForeignRequest.into());
         }
-        if !request.frames.contains(&frame) {
-            return Err(BindingError::MissingFrame);
-        }
-        for output in request.outputs.iter().filter(|o| o.frame == frame) {
+        let range = request
+            .frame_slices
+            .get(&frame)
+            .cloned()
+            .ok_or(BindingError::MissingFrame)?;
+        for output in &request.outputs[range.clone()] {
             let entry = &self.outputs[output.entry];
             (entry.check)(snapshot)?;
             (entry.validate_component)(world)?;
-            (output.output.validate)(results)?;
+            (entry.validate_result)(results, output.ticket)?;
         }
-        for output in request.outputs.iter().filter(|o| o.frame == frame) {
-            (output.output.apply)(world, results)?;
+        for output in &request.outputs[range] {
+            let entry = &self.outputs[output.entry];
+            (entry.apply)(world, results, output.ticket)?;
         }
         Ok(())
     }
